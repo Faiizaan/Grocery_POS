@@ -13,34 +13,73 @@ const passwordFromEnv = (name: string) => (process.env[name] || "").trim();
 /** ---------------------------
  *  GET /api/products/search?q=...
  *  (POS sales screen — name, SKU, or barcode)
+ *  Order: exact barcode/SKU match first, then in-stock products (A-Z), then
+ *  out-of-stock ones (A-Z) only if there is room left in the 20 results.
+ *  Previously everything was A-Z, so out-of-stock items could push the
+ *  sellable ones down or off the list.
  * --------------------------- */
+const SEARCH_LIMIT = 20;
+const searchSelect = {
+  id: true,
+  name: true,
+  sku: true,
+  barcode: true,
+  salePrice: true,
+  taxRate: true,
+  stock: true,
+  categoryId: true,
+  categoryRef: { select: { id: true, name: true } },
+} as const;
+
 products.get("/search", async (req, res) => {
   const q = String(req.query.q || "").trim();
   if (!q) return res.json([]);
 
-  const items = await prisma.product.findMany({
-    where: {
-      deletedAt: null,
-      OR: [
-        { name: { contains: q, mode: "insensitive" } },
-        { sku: { equals: q } },
-        { barcode: q ? { equals: q } : undefined },
-      ],
-    },
-    take: 20,
-    orderBy: { name: "asc" },
-    select: {
-      id: true,
-      name: true,
-      sku: true,
-      barcode: true,
-      salePrice: true,
-      taxRate: true,
-      stock: true,
-      categoryId: true,
-      categoryRef: { select: { id: true, name: true } },
-    },
-  });
+  const match = {
+    deletedAt: null,
+    OR: [
+      { name: { contains: q, mode: "insensitive" as const } },
+      { sku: { equals: q } },
+      { barcode: { equals: q } },
+    ],
+  };
+
+  const [exact, inStock] = await Promise.all([
+    prisma.product.findMany({
+      where: { deletedAt: null, OR: [{ sku: q }, { barcode: q }] },
+      select: searchSelect,
+      take: 2,
+    }),
+    prisma.product.findMany({
+      where: { ...match, stock: { gt: 0 } },
+      orderBy: { name: "asc" },
+      take: SEARCH_LIMIT,
+      select: searchSelect,
+    }),
+  ]);
+
+  const seen = new Set<number>();
+  const items: typeof inStock = [];
+  const push = (list: typeof inStock) => {
+    for (const p of list) {
+      if (items.length >= SEARCH_LIMIT) return;
+      if (seen.has(p.id)) continue;
+      seen.add(p.id);
+      items.push(p);
+    }
+  };
+  push(exact);
+  push(inStock);
+
+  if (items.length < SEARCH_LIMIT) {
+    const outOfStock = await prisma.product.findMany({
+      where: { ...match, stock: { lte: 0 } },
+      orderBy: { name: "asc" },
+      take: SEARCH_LIMIT,
+      select: searchSelect,
+    });
+    push(outOfStock);
+  }
 
   res.json(items);
 });
@@ -152,6 +191,54 @@ products.post("/stock-value", requireRole("MANAGER", "ADMIN"), async (req, res) 
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Failed to compute stock value" });
+  }
+});
+
+/** ---------------------------
+ *  GET /api/products/quick-items?limit=6&days=30
+ *  Best sellers for the checkout "Quick items" buttons, picked automatically:
+ *  ranked by how many (non-voided) sales they appeared in over the last `days`.
+ *  Deleted and out-of-stock products are skipped so every button is usable.
+ * --------------------------- */
+products.get("/quick-items", async (req, res) => {
+  const limit = Math.min(24, Math.max(1, Number(req.query.limit) || 6));
+  const days = Math.min(365, Math.max(1, Number(req.query.days) || 30));
+  const since = new Date();
+  since.setDate(since.getDate() - days);
+
+  try {
+    const ranked = await prisma.$queryRaw<{ id: number }[]>`
+      SELECT p."id"
+      FROM "SaleItem" si
+      JOIN "Sale" s ON s."id" = si."saleId"
+      JOIN "Product" p ON p."id" = si."productId"
+      WHERE s."voidedAt" IS NULL
+        AND s."createdAt" >= ${since}
+        AND p."deletedAt" IS NULL
+        AND p."stock" > 0
+      GROUP BY p."id"
+      ORDER BY COUNT(DISTINCT si."saleId") DESC, SUM(si."qty") DESC
+      LIMIT ${limit}`;
+
+    const ids = ranked.map((r) => Number(r.id));
+    const rows = await prisma.product.findMany({
+      where: { id: { in: ids } },
+      select: {
+        id: true,
+        name: true,
+        sku: true,
+        barcode: true,
+        salePrice: true,
+        taxRate: true,
+        stock: true,
+        categoryId: true,
+      },
+    });
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    res.json(ids.map((id) => byId.get(id)).filter(Boolean));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Failed to load quick items" });
   }
 });
 

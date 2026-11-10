@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { useQuery } from '@tanstack/react-query';
 import BarcodeInput from '../components/BarcodeInput';
 import { StatusLine, type PageFeedback } from '../components/StatusLine';
 import { useDebouncedValue } from '../hooks/useDebouncedValue';
@@ -10,6 +11,7 @@ import {
     type ProductSearchHit,
 } from '../hooks/queries';
 import { ApiError, getJson } from '../lib/apiJson';
+import { queryKeys } from '../lib/queryKeys';
 import {
     lineStockStatus,
     parseStock,
@@ -21,27 +23,86 @@ type Product = ProductSearchHit;
 
 type CartItem = { product: Product; quantity: number; lineDiscount: number };
 
+/** "3*lays" -> { qty: 3, term: "lays" }. Works with a scanner too: type 3*, then scan. */
+function parseQuery(raw: string) {
+    const m = raw.match(/^\s*(\d{1,4})\s*\*\s*(.*)$/);
+    if (!m) return { qty: 1, term: raw.trim(), hasQty: false };
+    return { qty: Math.max(1, Number(m[1])), term: m[2].trim(), hasQty: true };
+}
+
+const QUICK_ITEMS = 6;
+
+/**
+ * Keyboard-first checkout.
+ *  Search box  : type, ↑ ↓ to choose, Enter to add. "3*" in front adds 3.
+ *                Enter on an empty box jumps to Cash.
+ *  Cart        : the last added line is selected. With the search box empty:
+ *                + / − change its qty, ↑ ↓ select another line, Del removes it.
+ *  F2 search · F3 type qty · F4 quick items · F8 cash · F9 exact cash + complete
+ *  F10 / Ctrl+S complete · Shift+Del clear cart · Esc back to search
+ */
 export default function SalesPage() {
     const [query, setQuery] = useState('');
-    const debouncedQuery = useDebouncedValue(query, 250);
-    const { data: results = [] } = useProductSearchQuery(debouncedQuery);
+    const parsed = parseQuery(query);
+    const debouncedTerm = useDebouncedValue(parsed.term, 200);
+    const { data: results = [] } = useProductSearchQuery(debouncedTerm);
+    const resultsFresh = debouncedTerm === parsed.term && parsed.term.length > 0;
+    const [highlight, setHighlight] = useState(0);
+
+    const { data: quickItems = [], refetch: refetchQuickItems } = useQuery({
+        queryKey: [...queryKeys.products.all, 'quick-items', QUICK_ITEMS],
+        queryFn: () => getJson<Product[]>(`/api/products/quick-items?limit=${QUICK_ITEMS}`),
+        staleTime: 5 * 60_000,
+    });
+
     const { data: sessionData } = useCashSessionCurrentQuery();
     const createSale = useCreateSaleMutation();
     const cashSessionOpen =
         sessionData === undefined ? null : sessionData.session != null;
     const cashSessionId = sessionData?.session?.id ?? null;
     const [cart, setCart] = useState<CartItem[]>([]);
+    const [selectedId, setSelectedId] = useState<number | null>(null);
     const [feedback, setFeedback] = useState<PageFeedback>(null);
     const [cashTendered, setCashTendered] = useState('');
     const [printReceipt, setPrintReceipt] = useState(true);
     const saving = createSale.isPending;
     const searchRef = useRef<HTMLInputElement>(null);
     const cashRef = useRef<HTMLInputElement>(null);
+    const quickRef = useRef<HTMLDivElement>(null);
+    const suggestRef = useRef<HTMLDivElement>(null);
+    const qtyRefs = useRef(new Map<number, HTMLInputElement>());
     const scanLockRef = useRef(false);
 
     useEffect(() => {
         searchRef.current?.focus();
     }, []);
+
+    // index of the next in-stock result from `from` in direction `dir` (skips out-of-stock rows)
+    const nextInStock = (from: number, dir: 1 | -1) => {
+        for (let i = from; i >= 0 && i < results.length; i += dir) {
+            if (parseStock(results[i].stock) > 0) return i;
+        }
+        return -1;
+    };
+
+    // new results -> highlight the first in-stock one
+    useEffect(() => {
+        const first = results.findIndex(p => parseStock(p.stock) > 0);
+        setHighlight(first >= 0 ? first : 0);
+    }, [debouncedTerm, results]);
+
+    // keep the highlighted result visible when moving with ↑ ↓ (the list scrolls with it)
+    useEffect(() => {
+        const row = suggestRef.current?.querySelector<HTMLElement>('.suggest-item-active');
+        row?.scrollIntoView({ block: 'nearest' });
+    }, [highlight, results]);
+
+    // keep a valid selection when lines are removed
+    useEffect(() => {
+        if (selectedId != null && !cart.some(ci => ci.product.id === selectedId)) {
+            setSelectedId(cart.length ? cart[cart.length - 1].product.id : null);
+        }
+    }, [cart, selectedId]);
 
     const focusSearch = () => {
         setQuery('');
@@ -73,7 +134,7 @@ export default function SalesPage() {
         return null;
     };
 
-    const addToCart = useCallback((p: Product) => {
+    const addToCart = useCallback((p: Product, qty = 1) => {
         const stock = parseStock(p.stock);
         if (stock <= 0) {
             setFeedback({
@@ -83,10 +144,12 @@ export default function SalesPage() {
             focusSearch();
             return;
         }
+        let added = true;
         setCart(prev => {
             const i = prev.findIndex(ci => ci.product.id === p.id);
-            const nextQty = i >= 0 ? prev[i].quantity + 1 : 1;
+            const nextQty = (i >= 0 ? prev[i].quantity : 0) + qty;
             if (nextQty > stock) {
+                added = false;
                 setFeedback({
                     variant: 'error',
                     message: `Only ${stock} in stock for "${p.name}".`,
@@ -99,13 +162,14 @@ export default function SalesPage() {
                 next[i] = { ...next[i], product: p, quantity: nextQty };
                 return next;
             }
-            return [...prev, { product: p, quantity: 1, lineDiscount: 0 }];
+            return [...prev, { product: p, quantity: qty, lineDiscount: 0 }];
         });
-        setFeedback(null);
+        if (added) setFeedback(null);
+        setSelectedId(p.id);
         focusSearch();
     }, []);
 
-    const handleScan = useCallback(async (code: string) => {
+    const handleScan = useCallback(async (code: string, qty = 1) => {
         const trimmed = code.trim();
         if (!trimmed || scanLockRef.current) return;
         scanLockRef.current = true;
@@ -113,7 +177,7 @@ export default function SalesPage() {
         try {
             const product = await resolveProductByCode(trimmed);
             if (product) {
-                addToCart(product);
+                addToCart(product, qty);
                 return;
             }
             setFeedback({ variant: 'error', message: `No product found for "${trimmed}"` });
@@ -184,6 +248,7 @@ export default function SalesPage() {
         let totalDiscount = 0;
         let subtotal = 0;
         let tax = 0;
+        let pieces = 0;
         for (const ci of cart) {
             const unit = parseFloat(ci.product.salePrice);
             const gross = unit * ci.quantity;
@@ -194,12 +259,14 @@ export default function SalesPage() {
             totalDiscount += disc;
             subtotal += net;
             tax += lineTax;
+            pieces += ci.quantity;
         }
         return {
             subtotalPre,
             totalDiscount,
             subtotal,
             tax,
+            pieces,
             total: subtotal + tax,
         };
     }, [cart]);
@@ -216,16 +283,6 @@ export default function SalesPage() {
 
     const cashInsufficient = totals.total > 0 && cashAmount < totals.total;
 
-    // Ctrl+S
-    useEffect(() => {
-        const onKey = (e: KeyboardEvent) => {
-            if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') { e.preventDefault(); saveSale(); }
-        };
-        window.addEventListener('keydown', onKey);
-        return () => window.removeEventListener('keydown', onKey);
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [cart, cashTendered]);
-
     const setExactCash = () => setCashTendered(totals.total.toFixed(2));
 
     const stockStatusLabel = (status: StockLineStatus) => {
@@ -241,8 +298,10 @@ export default function SalesPage() {
         }
     };
 
-    const saveSale = async () => {
+    /** cashOverride: used by F9 (exact cash) so we don't wait for state to update */
+    const saveSale = async (cashOverride?: number) => {
         if (!cart.length || saving) return;
+        const paid = cashOverride ?? cashAmount;
         if (checkoutBlocked) {
             setFeedback({
                 variant: 'error',
@@ -251,8 +310,8 @@ export default function SalesPage() {
             });
             return;
         }
-        if (cashInsufficient) {
-            const message = !cashTendered.trim()
+        if (totals.total > 0 && paid < totals.total) {
+            const message = cashOverride === undefined && !cashTendered.trim()
                 ? 'Enter the cash tendered amount.'
                 : 'Cash tendered must be at least the total due.';
             setFeedback({ variant: 'error', message });
@@ -268,15 +327,17 @@ export default function SalesPage() {
                 unitPrice: ci.product.salePrice,
                 ...(ci.lineDiscount > 0 ? { discountValue: ci.lineDiscount } : {}),
             })),
-            paidCash: cashAmount.toFixed(2),
+            paidCash: paid.toFixed(2),
         };
         if (cashSessionId != null) payload.sessionId = cashSessionId;
         try {
             const data = await createSale.mutateAsync(payload);
             const saleId = data.sale.id;
             setCart([]);
+            setSelectedId(null);
             setCashTendered('');
             focusSearch();
+            void refetchQuickItems();
             if (printReceipt) {
                 const url = `${window.location.origin}/sales/${saleId}?print=1`;
                 window.open(url, '_blank', 'noopener,noreferrer');
@@ -321,6 +382,156 @@ export default function SalesPage() {
         }
     };
 
+    // ---- keyboard ----------------------------------------------------------
+
+    const selectedIndex = cart.findIndex(ci => ci.product.id === selectedId);
+    const selectedItem = selectedIndex >= 0 ? cart[selectedIndex] : null;
+
+    const moveSelection = (delta: number) => {
+        if (!cart.length) return;
+        const from = selectedIndex >= 0 ? selectedIndex : cart.length - 1;
+        const to = Math.min(cart.length - 1, Math.max(0, from + delta));
+        setSelectedId(cart[to].product.id);
+    };
+
+    const editSelectedQty = () => {
+        if (!selectedItem) return;
+        const el = qtyRefs.current.get(selectedItem.product.id);
+        el?.focus();
+        el?.select();
+    };
+
+    const clearCart = () => {
+        if (!cart.length) return;
+        if (!window.confirm('Clear all items from the cart?')) return;
+        setCart([]);
+        setSelectedId(null);
+        setCashTendered('');
+        setFeedback(null);
+        focusSearch();
+    };
+
+    const onSearchKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+        const showingResults = resultsFresh && results.length > 0;
+        const emptyBox = query.trim() === '';
+
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+            e.preventDefault();
+            const d = e.key === 'ArrowDown' ? 1 : -1;
+            if (showingResults) {
+                const next = nextInStock(highlight + d, d);
+                if (next >= 0) setHighlight(next);
+            } else if (emptyBox) {
+                moveSelection(d);
+            }
+            return;
+        }
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            if (emptyBox) {
+                // nothing typed: go to payment
+                if (cart.length) cashRef.current?.focus();
+                return;
+            }
+            // a typed/scanned barcode or SKU always means that exact product
+            const exact = showingResults
+                ? results.find(p => p.barcode === parsed.term || p.sku === parsed.term)
+                : undefined;
+            if (exact) {
+                addToCart(exact, parsed.qty);
+            } else if (showingResults && results[highlight]) {
+                addToCart(results[highlight], parsed.qty);
+            } else {
+                void handleScan(parsed.term, parsed.qty);
+            }
+            return;
+        }
+        if (e.key === 'Escape') {
+            e.preventDefault();
+            setQuery('');
+            return;
+        }
+        if (emptyBox && selectedItem) {
+            if (e.key === '+' || e.key === '=') {
+                e.preventDefault();
+                updateQty(selectedItem.product.id, selectedItem.quantity + 1);
+            } else if (e.key === '-') {
+                e.preventDefault();
+                updateQty(selectedItem.product.id, selectedItem.quantity - 1);
+            } else if (e.key === 'Delete' && !e.shiftKey) {
+                e.preventDefault();
+                removeItem(selectedItem.product.id);
+            }
+        }
+    };
+
+    // Global shortcuts. Handlers read the latest state through this ref.
+    const shortcuts = useRef<(e: KeyboardEvent) => void>(() => {});
+    shortcuts.current = (e: KeyboardEvent) => {
+        const key = e.key;
+        if ((e.ctrlKey || e.metaKey) && key.toLowerCase() === 's') {
+            e.preventDefault();
+            void saveSale();
+            return;
+        }
+        switch (key) {
+            case 'F2':
+                e.preventDefault();
+                focusSearch();
+                break;
+            case 'F3':
+                e.preventDefault();
+                editSelectedQty();
+                break;
+            case 'F4': {
+                e.preventDefault();
+                const first = quickRef.current?.querySelector<HTMLButtonElement>('button:not(:disabled)');
+                first?.focus();
+                break;
+            }
+            case 'F8':
+                e.preventDefault();
+                if (cart.length) {
+                    cashRef.current?.focus();
+                    cashRef.current?.select();
+                }
+                break;
+            case 'F9':
+                e.preventDefault();
+                if (cart.length) {
+                    setExactCash();
+                    void saveSale(Number(totals.total.toFixed(2)));
+                }
+                break;
+            case 'F10':
+                e.preventDefault();
+                void saveSale();
+                break;
+            case 'Delete':
+                if (e.shiftKey) {
+                    e.preventDefault();
+                    clearCart();
+                }
+                break;
+            case 'Escape': {
+                const t = e.target as HTMLElement | null;
+                if (t && t !== searchRef.current && (t.tagName === 'INPUT' || t.tagName === 'BUTTON')) {
+                    e.preventDefault();
+                    focusSearch();
+                }
+                break;
+            }
+        }
+    };
+
+    useEffect(() => {
+        const onKey = (e: KeyboardEvent) => shortcuts.current(e);
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+    }, []);
+
+    const showResults = parsed.term.length > 0 && results.length > 0;
+
     return (
         <div className="sales-page">
             <h2>Checkout</h2>
@@ -342,200 +553,269 @@ export default function SalesPage() {
                 <StatusLine variant={feedback.variant}>{feedback.message}</StatusLine>
             )}
 
-            {/* Search toolbar */}
-            <div className="sales-toolbar">
-                <div className="field">
-                    <label>Search product (name / SKU / barcode)</label>
-                    <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start', flexWrap: 'wrap' }}>
-                        <input
-                            ref={searchRef}
-                            value={query}
-                            onChange={e => { setQuery(e.target.value); setFeedback(null); }}
-                            onKeyDown={e => {
-                                if (e.key === 'Enter') {
-                                    e.preventDefault();
-                                    void handleScan(query);
-                                }
-                            }}
-                            placeholder="Scan barcode or type to search"
-                            style={{ flex: '1 1 200px', minWidth: 200 }}
-                        />
-                        <BarcodeInput onScan={handleScan} />
-                    </div>
-                    {!!results.length && (
-                        <div className="suggest-list">
-                            {results.map(p => {
-                                const stock = parseStock(p.stock);
-                                const out = stock <= 0;
-                                return (
-                                <button
-                                    key={p.id}
-                                    type="button"
-                                    onClick={() => addToCart(p)}
-                                    className={`suggest-item${out ? ' suggest-item-out' : ''}`}
-                                    disabled={out}
-                                >
-                                    <div className="title">{p.name}</div>
-                                    <div className="meta">
-                                        {p.sku}{p.barcode ? ` • ${p.barcode}` : ''} • Rs {p.salePrice} • Stock {stock}
-                                        {out ? ' • Out of stock' : ''}
+            <div className="checkout-grid">
+                {/* ---------------- left: search + cart ---------------- */}
+                <div className="checkout-main">
+                    <div className="sales-toolbar">
+                        <div className="field" style={{ flex: 1 }}>
+                            <label htmlFor="checkout-search">
+                                Search product (name / SKU / barcode) — type <kbd>3*</kbd> first to add 3
+                            </label>
+                            <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start', flexWrap: 'wrap' }}>
+                                <div className="search-box">
+                                    {parsed.hasQty && <span className="qty-chip">{parsed.qty} ×</span>}
+                                    <input
+                                        id="checkout-search"
+                                        ref={searchRef}
+                                        value={query}
+                                        autoComplete="off"
+                                        onChange={e => { setQuery(e.target.value); setFeedback(null); }}
+                                        onKeyDown={onSearchKeyDown}
+                                        placeholder="Scan barcode or type to search"
+                                    />
+                                    <kbd className="search-key">F2</kbd>
+                                </div>
+                                <BarcodeInput onScan={code => handleScan(code)} />
+                            </div>
+                            {showResults && (
+                                <div className="suggest-list" role="listbox" aria-label="Search results" ref={suggestRef}>
+                                    {results.map((p, i) => {
+                                        const stock = parseStock(p.stock);
+                                        const out = stock <= 0;
+                                        const active = resultsFresh && i === highlight;
+                                        return (
+                                            <button
+                                                key={p.id}
+                                                type="button"
+                                                role="option"
+                                                aria-selected={active}
+                                                tabIndex={-1}
+                                                onMouseMove={() => { if (!out && highlight !== i) setHighlight(i); }}
+                                                onClick={() => addToCart(p, parsed.qty)}
+                                                className={`suggest-item${out ? ' suggest-item-out' : ''}${active ? ' suggest-item-active' : ''}`}
+                                                disabled={out}
+                                            >
+                                                <div className="title">{p.name}</div>
+                                                <div className="meta">
+                                                    {p.sku}{p.barcode ? ` • ${p.barcode}` : ''} • Rs {p.salePrice} • Stock {stock}
+                                                    {out ? ' • Out of stock' : ''}
+                                                </div>
+                                            </button>
+                                        );
+                                    })}
+                                    <div className="suggest-hint">
+                                        <kbd>↑</kbd> <kbd>↓</kbd> choose · <kbd>Enter</kbd> add{parsed.qty > 1 ? ` ${parsed.qty}` : ''} · <kbd>Esc</kbd> clear
                                     </div>
-                                </button>
-                            );
-                            })}
+                                </div>
+                            )}
                         </div>
-                    )}
-                </div>
-            </div>
+                    </div>
 
-            {/* Cart grid header */}
-            <div className="cart grid-header">
-                <div className="grid grid-7 header-row">
-                    <div className="col span-2">Item</div>
-                    <div>Unit</div>
-                    <div>Tax %</div>
-                    <div>Qty</div>
-                    <div>Discount</div>
-                    <div className="text-right">Line (pre-tax)</div>
+                    <div className="cart grid-header">
+                        <div className="grid grid-7 header-row">
+                            <div className="col span-2">Item</div>
+                            <div>Unit</div>
+                            <div>Tax %</div>
+                            <div>Qty</div>
+                            <div>Discount</div>
+                            <div className="text-right">Line (pre-tax)</div>
+                        </div>
+
+                        {cart.length === 0 && (
+                            <div className="cart-empty">Cart is empty — scan, search, or press a quick item.</div>
+                        )}
+
+                        {cart.map(ci => {
+                            const unit = parseFloat(ci.product.salePrice);
+                            const gross = unit * ci.quantity;
+                            const net = gross - ci.lineDiscount;
+                            const stockStatus =
+                                cartStockByProductId.get(ci.product.id) ?? 'ok';
+                            const stockMsg = stockStatusLabel(stockStatus);
+                            const stockNum = parseStock(ci.product.stock);
+                            const isSelected = ci.product.id === selectedId;
+                            return (
+                                <div
+                                    key={ci.product.id}
+                                    className={`grid grid-7 item-row stock-line-${stockStatus}${isSelected ? ' item-row-selected' : ''}`}
+                                    onClick={() => setSelectedId(ci.product.id)}
+                                >
+                                    <div className="col span-2">
+                                        <div className="title">{ci.product.name}</div>
+                                        <div className="muted">{ci.product.sku}{ci.product.barcode ? ` • ${ci.product.barcode}` : ''}</div>
+                                        {stockMsg && (
+                                            <div className="stock-line-warning">{stockMsg} (available: {stockNum})</div>
+                                        )}
+                                    </div>
+                                    <div>Rs {unit.toFixed(2)}</div>
+                                    <div>{parseFloat(ci.product.taxRate).toFixed(2)}%</div>
+                                    <div className="qty-cell">
+                                        <input
+                                            ref={el => {
+                                                if (el) qtyRefs.current.set(ci.product.id, el);
+                                                else qtyRefs.current.delete(ci.product.id);
+                                            }}
+                                            type="number" min={1} step={1} value={ci.quantity}
+                                            onFocus={() => setSelectedId(ci.product.id)}
+                                            onChange={e => updateQty(ci.product.id, Number(e.target.value))}
+                                            onKeyDown={e => {
+                                                if (e.key === 'Enter') {
+                                                    e.preventDefault();
+                                                    focusSearch();
+                                                }
+                                            }}
+                                        />
+                                        <button type="button" onClick={() => removeItem(ci.product.id)} className="btn btn-danger btn-sm">Remove</button>
+                                    </div>
+                                    <div>
+                                        <input
+                                            type="number"
+                                            min={0}
+                                            step={1}
+                                            value={ci.lineDiscount || ''}
+                                            placeholder="0"
+                                            onChange={e =>
+                                                updateLineDiscount(
+                                                    ci.product.id,
+                                                    Number(e.target.value) || 0
+                                                )
+                                            }
+                                            onKeyDown={e => {
+                                                if (e.key === 'Enter') {
+                                                    e.preventDefault();
+                                                    focusSearch();
+                                                }
+                                            }}
+                                            style={{ width: 72 }}
+                                        />
+                                    </div>
+                                    <div className="text-right strong">Rs {net.toFixed(2)}</div>
+                                </div>
+                            );
+                        })}
+                        {cart.length > 0 && (
+                            <div className="cart-hint">
+                                Selected line (search box empty): <kbd>+</kbd> <kbd>−</kbd> qty ·{' '}
+                                <kbd>↑</kbd> <kbd>↓</kbd> select · <kbd>F3</kbd> type qty · <kbd>Del</kbd> remove
+                            </div>
+                        )}
+                    </div>
                 </div>
 
-                {/* Cart rows */}
-                {cart.map(ci => {
-                    const unit = parseFloat(ci.product.salePrice);
-                    const gross = unit * ci.quantity;
-                    const net = gross - ci.lineDiscount;
-                    const stockStatus =
-                        cartStockByProductId.get(ci.product.id) ?? 'ok';
-                    const stockMsg = stockStatusLabel(stockStatus);
-                    const stockNum = parseStock(ci.product.stock);
-                    return (
-                        <div
-                            key={ci.product.id}
-                            className={`grid grid-7 item-row stock-line-${stockStatus}`}
-                        >
-                            <div className="col span-2">
-                                <div className="title">{ci.product.name}</div>
-                                <div className="muted">{ci.product.sku}{ci.product.barcode ? ` • ${ci.product.barcode}` : ''}</div>
-                                {stockMsg && (
-                                    <div className="stock-line-warning">{stockMsg} (available: {stockNum})</div>
-                                )}
-                            </div>
-                            <div>Rs {unit.toFixed(2)}</div>
-                            <div>{parseFloat(ci.product.taxRate).toFixed(2)}%</div>
-                            <div className="qty-cell">
+                {/* ---------------- right: quick items + totals + payment ---------------- */}
+                <div className="checkout-side">
+                    <div className="panel quick-panel">
+                        <div className="panel-title">
+                            Quick items <span className="muted-small">top sellers · <kbd>F4</kbd></span>
+                        </div>
+                        <div className="quick-grid" ref={quickRef}>
+                            {quickItems.map(p => {
+                                const out = parseStock(p.stock) <= 0;
+                                return (
+                                    <button
+                                        key={p.id}
+                                        type="button"
+                                        className="quick-tile"
+                                        disabled={out}
+                                        title={p.name}
+                                        onClick={() => addToCart(p, parsed.hasQty ? parsed.qty : 1)}
+                                    >
+                                        <span className="quick-name">{p.name}</span>
+                                        <span className="quick-price">Rs {Number(p.salePrice).toFixed(0)}</span>
+                                    </button>
+                                );
+                            })}
+                            {quickItems.length === 0 && (
+                                <div className="muted-small">No sales in the last 30 days yet.</div>
+                            )}
+                        </div>
+                    </div>
+
+                    <div className="panel">
+                        <div className="panel-title">Summary</div>
+                        <div className="row"><span>Items</span><span>{cart.length} lines · {totals.pieces} pcs</span></div>
+                        <div className="row"><span>Subtotal (pre-disc)</span><span>Rs {totals.subtotalPre.toFixed(2)}</span></div>
+                        <div className="row"><span>Line discounts</span><span>- Rs {totals.totalDiscount.toFixed(2)}</span></div>
+                        {totals.tax > 0 && (
+                            <div className="row"><span>Tax</span><span>Rs {totals.tax.toFixed(2)}</span></div>
+                        )}
+                        <div className="row total"><span>Total</span><span>Rs {totals.total.toFixed(2)}</span></div>
+                    </div>
+
+                    <div className="panel payment-panel">
+                        <div className="panel-title">Payment (cash)</div>
+                        <div className="field">
+                            <label htmlFor="cash-tendered">Cash tendered <kbd>F8</kbd></label>
+                            <div className="cash-input-row">
                                 <input
-                                    type="number" min={1} step={1} value={ci.quantity}
-                                    onChange={e => updateQty(ci.product.id, Number(e.target.value))}
-                                />
-                                <button type="button" onClick={() => removeItem(ci.product.id)} className="btn btn-danger btn-sm">Remove</button>
-                            </div>
-                            <div>
-                                <input
+                                    id="cash-tendered"
+                                    ref={cashRef}
                                     type="number"
                                     min={0}
                                     step={1}
-                                    value={ci.lineDiscount || ''}
-                                    placeholder="0"
-                                    onChange={e =>
-                                        updateLineDiscount(
-                                            ci.product.id,
-                                            Number(e.target.value) || 0
-                                        )
-                                    }
-                                    style={{ width: 72 }}
+                                    value={cashTendered}
+                                    onChange={e => { setCashTendered(e.target.value); setFeedback(null); }}
+                                    onKeyDown={e => {
+                                        if (e.key === 'Enter') {
+                                            e.preventDefault();
+                                            void saveSale();
+                                        }
+                                    }}
+                                    placeholder="0.00"
+                                    disabled={!cart.length}
                                 />
+                                <button
+                                    type="button"
+                                    className="btn btn-sm"
+                                    onClick={setExactCash}
+                                    disabled={!cart.length || totals.total <= 0}
+                                >
+                                    Exact
+                                </button>
                             </div>
-                            <div className="text-right strong">Rs {net.toFixed(2)}</div>
                         </div>
-                    );
-                })}
-            </div>
-
-            {/* Summary + Payment */}
-            <div className="two-col" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
-                <div className="panel">
-                    <div className="panel-title">Summary</div>
-                    <div className="row"><span>Subtotal (pre-disc)</span><span>Rs {totals.subtotalPre.toFixed(2)}</span></div>
-                    <div className="row"><span>Line discounts</span><span>- Rs {totals.totalDiscount.toFixed(2)}</span></div>
-                    <div className="row"><span>Subtotal (after disc)</span><span>Rs {totals.subtotal.toFixed(2)}</span></div>
-                    <div className="row"><span>Tax</span><span>Rs {totals.tax.toFixed(2)}</span></div>
-                    <div className="row total"><span>Total</span><span>Rs {totals.total.toFixed(2)}</span></div>
-                    <p className="hint" style={{ marginTop: 8 }}>
-                        Enter a discount on each line item (not split across the cart).
-                    </p>
-                </div>
-
-                <div className="panel payment-panel">
-                    <div className="panel-title">Payment (cash)</div>
-                    <div className="row total"><span>Total due</span><span>Rs {totals.total.toFixed(2)}</span></div>
-                    <div className="field" style={{ marginTop: 10 }}>
-                        <label htmlFor="cash-tendered">Cash tendered</label>
-                        <div className="cash-input-row">
+                        <div className={`row change-row ${cashInsufficient ? 'change-insufficient' : ''}`}>
+                            <span>Change due</span>
+                            <span>Rs {changeDue.toFixed(2)}</span>
+                        </div>
+                        {cashInsufficient && cart.length > 0 && cashTendered.trim() !== '' && (
+                            <div className="hint" style={{ color: '#b91c1c' }}>
+                                Need Rs {(totals.total - cashAmount).toFixed(2)} more
+                            </div>
+                        )}
+                        <label className="print-receipt-check">
                             <input
-                                id="cash-tendered"
-                                ref={cashRef}
-                                type="number"
-                                min={0}
-                                step={1}
-                                value={cashTendered}
-                                onChange={e => { setCashTendered(e.target.value); setFeedback(null); }}
-                                onKeyDown={e => {
-                                    if (e.key === 'Enter') {
-                                        e.preventDefault();
-                                        void saveSale();
-                                    }
-                                }}
-                                placeholder="0.00"
-                                disabled={!cart.length}
+                                type="checkbox"
+                                checked={printReceipt}
+                                onChange={e => setPrintReceipt(e.target.checked)}
                             />
-                            <button
-                                type="button"
-                                className="btn btn-sm"
-                                onClick={setExactCash}
-                                disabled={!cart.length || totals.total <= 0}
-                            >
-                                Exact
-                            </button>
-                        </div>
+                            Print receipt after save
+                        </label>
+                        <button
+                            type="button"
+                            onClick={() => void saveSale()}
+                            className="btn btn-success complete-btn"
+                            disabled={!cart.length || saving || checkoutBlocked}
+                        >
+                            {saving ? 'Saving…' : 'Complete sale (F10)'}
+                        </button>
+                        {checkoutBlocked && (
+                            <div className="stock-checkout-blocked">Resolve stock issues to checkout</div>
+                        )}
                     </div>
-                    <div className={`row change-row ${cashInsufficient ? 'change-insufficient' : ''}`}>
-                        <span>Change due</span>
-                        <span>Rs {changeDue.toFixed(2)}</span>
-                    </div>
-                    {cashInsufficient && cart.length > 0 && (
-                        <div className="hint" style={{ color: '#b91c1c' }}>
-                            Need Rs {(totals.total - cashAmount).toFixed(2)} more
-                        </div>
-                    )}
-                    <label className="print-receipt-check">
-                        <input
-                            type="checkbox"
-                            checked={printReceipt}
-                            onChange={e => setPrintReceipt(e.target.checked)}
-                        />
-                        Print receipt after save
-                    </label>
                 </div>
             </div>
 
-            {/* Footer actions */}
-            <div className="flex-between">
-                <div className="kbd-hint">
-                    Press <kbd>Ctrl</kbd> + <kbd>S</kbd> to complete sale
-                    {checkoutBlocked && (
-                        <span className="stock-checkout-blocked">
-                            {' '}— resolve stock issues to checkout
-                        </span>
-                    )}
-                </div>
-                <button
-                    type="button"
-                    onClick={saveSale}
-                    className="btn btn-success"
-                    disabled={!cart.length || saving || checkoutBlocked}
-                >
-                    {saving ? 'Saving…' : 'Complete Sale'}
-                </button>
+            {/* Shortcut strip */}
+            <div className="key-strip" aria-label="Keyboard shortcuts">
+                <span><kbd>F2</kbd> Search</span>
+                <span><kbd>F3</kbd> Qty</span>
+                <span><kbd>F4</kbd> Quick items</span>
+                <span><kbd>F8</kbd> Cash</span>
+                <span><kbd>F9</kbd> Exact cash + complete</span>
+                <span className="key-strip-main"><kbd>F10</kbd> Complete sale</span>
+                <span><kbd>Esc</kbd> Back to search</span>
+                <span><kbd>Shift</kbd>+<kbd>Del</kbd> Clear cart</span>
             </div>
         </div>
     );

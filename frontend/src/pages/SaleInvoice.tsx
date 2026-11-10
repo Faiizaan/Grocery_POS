@@ -451,12 +451,6 @@ export default function SaleInvoice() {
           font-weight: 800;
         }
 
-        .doctor-line {
-          margin: 0 0 8px;
-          font-size: 11px;
-          font-weight: 700;
-        }
-
         .qr-block {
           display: flex;
           flex-direction: column;

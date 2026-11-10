@@ -1,3 +1,4 @@
+import { formatDateTime } from "../lib/time";
 import { Link, useParams } from "react-router-dom";
 import { usePurchaseQuery } from "../hooks/queries";
 
@@ -7,6 +8,9 @@ type Item = {
     unitCost: string;
     lineDiscount?: string;
     lineTotal: string;
+    boxes?: string | null;
+    piecesPerBox?: number | null;
+    boxCost?: string | null;
     product: { name: string; sku: string; barcode?: string | null };
 };
 
@@ -38,7 +42,7 @@ export default function PurchaseShow() {
             </div>
 
             <h2>Purchase #{purchase.id}</h2>
-            <div>{new Date(purchase.createdAt).toLocaleString()}</div>
+            <div>{formatDateTime(purchase.createdAt)}</div>
             <div>Supplier: {purchase.supplier?.name || "-"}</div>
             {purchase.note && <div>Note: {purchase.note}</div>}
 
@@ -58,7 +62,14 @@ export default function PurchaseShow() {
                         <tr key={it.id}>
                             <td>{it.product.name}</td>
                             <td>{it.product.sku}</td>
-                            <td style={{ textAlign: "right" }}>{+it.qty}</td>
+                            <td style={{ textAlign: "right" }}>
+                                {+it.qty}
+                                {it.boxes && it.piecesPerBox ? (
+                                    <div style={{ fontSize: 12, color: "#6b7280" }}>
+                                        {+it.boxes} box × {it.piecesPerBox} @ Rs {(+(it.boxCost ?? 0)).toFixed(2)}
+                                    </div>
+                                ) : null}
+                            </td>
                             <td style={{ textAlign: "right" }}>{(+it.unitCost).toFixed(2)}</td>
                             <td style={{ textAlign: "right" }}>
                                 {(+(it.lineDiscount ?? 0) > 0)

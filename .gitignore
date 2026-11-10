@@ -3,5 +3,7 @@ dist/
 .env
 *.env.local
 *.sql
+!backend/prisma/migrations/**/migration.sql
+backups/
 *.log
 .DS_Store

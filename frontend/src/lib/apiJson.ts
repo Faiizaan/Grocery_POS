@@ -2,11 +2,14 @@ import { apiFetch } from "./api";
 
 export class ApiError extends Error {
   status: number;
+  /** Parsed JSON body of the error response (if any). */
+  body: Record<string, unknown>;
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, body: Record<string, unknown> = {}) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.body = body;
   }
 }
 
@@ -21,7 +24,7 @@ export async function apiJson<T>(url: string, init?: RequestInit): Promise<T> {
   if (!res.ok) {
     const msg =
       (data as { error?: string }).error ?? `Request failed (${res.status})`;
-    throw new ApiError(msg, res.status);
+    throw new ApiError(msg, res.status, data as Record<string, unknown>);
   }
   return data;
 }

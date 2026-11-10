@@ -1,3 +1,4 @@
+import { formatDateTime, storeYmdDaysAgo } from "../lib/time";
 import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { StatusLine } from "../components/StatusLine";
@@ -38,6 +39,7 @@ type SaleLine = {
   lineTotal: string; // (still returned, but profit ignores tax)
   revenueExTax: string; // ✅
   costTotal: string; // ✅
+  unitCost?: string; // purchase cost per unit at the time of this sale
   profit: string; // ✅
   sale: {
     id: number;
@@ -68,13 +70,9 @@ export default function ProductDetails() {
     const params = new URLSearchParams();
 
     if (preset === "7") {
-      const d = new Date();
-      d.setDate(d.getDate() - 7);
-      params.set("from", d.toISOString().slice(0, 10));
+      params.set("from", storeYmdDaysAgo(7));
     } else if (preset === "30") {
-      const d = new Date();
-      d.setDate(d.getDate() - 30);
-      params.set("from", d.toISOString().slice(0, 10));
+      params.set("from", storeYmdDaysAgo(30));
     } else if (preset === "custom") {
       if (from) params.set("from", from);
       if (to) params.set("to", to);
@@ -329,6 +327,7 @@ export default function ProductDetails() {
               <th style={{ padding: 12, textAlign: "left" }}>Date</th>
               <th style={{ padding: 12, textAlign: "right" }}>Qty</th>
               <th style={{ padding: 12, textAlign: "right" }}>Unit</th>
+              <th style={{ padding: 12, textAlign: "right" }}>Unit cost</th>
               <th style={{ padding: 12, textAlign: "right" }}>
                 Revenue (ex tax)
               </th>
@@ -339,7 +338,7 @@ export default function ProductDetails() {
           <tbody>
             {sales.length === 0 ? (
               <tr>
-                <td colSpan={8} style={{ padding: 12, opacity: 0.7 }}>
+                <td colSpan={9} style={{ padding: 12, opacity: 0.7 }}>
                   No sales found for this product.
                 </td>
               </tr>
@@ -359,11 +358,14 @@ export default function ProductDetails() {
                     <td style={{ padding: 12 }}>{r.sale.id}</td>
                     <td style={{ padding: 12 }}>{r.sale.invoiceCode ?? "-"}</td>
                     <td style={{ padding: 12 }}>
-                      {new Date(r.sale.createdAt).toLocaleString()}
+                      {formatDateTime(r.sale.createdAt)}
                     </td>
                     <td style={{ padding: 12, textAlign: "right" }}>{r.qty}</td>
                     <td style={{ padding: 12, textAlign: "right" }}>
                       {r.unitPrice}
+                    </td>
+                    <td style={{ padding: 12, textAlign: "right" }}>
+                      {r.unitCost ?? "-"}
                     </td>
                     <td style={{ padding: 12, textAlign: "right" }}>
                       {rowRevenue}

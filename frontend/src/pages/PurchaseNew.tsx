@@ -5,7 +5,16 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useSupplierOptionsQuery } from "../hooks/queries";
 import { getJson } from "../lib/apiJson";
 
-type Product = { id: number; name: string; sku: string; price: string; stock: string; barcode?: string };
+type Product = {
+    id: number;
+    name: string;
+    sku: string;
+    price: string;
+    salePrice?: string;
+    stock: string;
+    barcode?: string;
+    piecesPerBox?: number | null;
+};
 
 type Line = {
     productId: number;
@@ -14,7 +23,29 @@ type Line = {
     unitCost: number;
     lineDiscount: number;
     newSalePrice?: number;
+    /** Last cost paid to the selected supplier (hint only). */
+    supplierLastCost?: number;
+    /** Enter this line per piece or per box. Stock/prices are always saved per piece. */
+    mode: "pieces" | "boxes";
+    boxes: number;
+    piecesPerBox: number | "";
+    boxCost: number;
+    newBoxSalePrice?: number;
 };
+
+const round2 = (n: number) => Math.round(n * 100) / 100;
+/** Per-piece cost is stored rounded to 2 decimals (220/6 = 36.67), so 36.67 x 6 = 220.02.
+ *  Undo that rounding when going back to a box price: if the box price is within the
+ *  rounding error of a whole rupee, use the whole rupee. */
+const boxPriceFromPiece = (piece: number, pieces: number) => {
+    const raw = piece * pieces;
+    const whole = Math.round(raw);
+    return Math.abs(raw - whole) <= 0.005 * pieces + 1e-9 ? whole : round2(raw);
+};
+const lineGross = (l: Line) =>
+    l.mode === "boxes" ? l.boxes * l.boxCost : l.qty * l.unitCost;
+const linePieces = (l: Line) =>
+    l.mode === "boxes" ? l.boxes * (Number(l.piecesPerBox) || 0) : l.qty;
 
 export default function PurchaseNew() {
     const queryClient = useQueryClient();
@@ -73,13 +104,19 @@ export default function PurchaseNew() {
             setFeedback({ variant: "error", message: "Select a supplier first." });
             return;
         }
+        // Default to the product's current purchase cost. It is updated by every purchase AND
+        // by manual edits on the Products page, so it is always the latest known cost.
+        // (Previously the supplier's last cost won, which brought back old prices after an edit.)
         const supplierCost = supplierPrices.get(p.id);
-        const unitCost = supplierCost ?? +p.price;
+        const unitCost = +p.price;
         setLines(prev => {
             const i = prev.findIndex(x => x.productId === p.id);
             if (i >= 0) {
                 const copy = [...prev];
-                copy[i] = { ...copy[i], qty: copy[i].qty + 1 };
+                copy[i] =
+                    copy[i].mode === "boxes"
+                        ? { ...copy[i], boxes: copy[i].boxes + 1 }
+                        : { ...copy[i], qty: copy[i].qty + 1 };
                 return copy;
             }
             return [
@@ -90,6 +127,12 @@ export default function PurchaseNew() {
                     qty: 1,
                     unitCost,
                     lineDiscount: 0,
+                    supplierLastCost: supplierCost,
+                    // products with a box size start in box mode
+                    mode: p.piecesPerBox ? "boxes" : "pieces",
+                    boxes: 1,
+                    piecesPerBox: p.piecesPerBox ?? "",
+                    boxCost: p.piecesPerBox ? boxPriceFromPiece(unitCost, p.piecesPerBox) : 0,
                 },
             ];
         });
@@ -97,7 +140,10 @@ export default function PurchaseNew() {
         setResults([]);
     };
 
-    const subtotalPre = lines.reduce((s, l) => s + l.qty * l.unitCost, 0);
+    const updLine = (i: number, patch: Partial<Line>) =>
+        setLines(x => x.map((y, j) => (j === i ? { ...y, ...patch } : y)));
+
+    const subtotalPre = lines.reduce((s, l) => s + lineGross(l), 0);
     const totalLineDiscount = lines.reduce((s, l) => s + l.lineDiscount, 0);
     const total = subtotalPre - totalLineDiscount;
 
@@ -110,17 +156,43 @@ export default function PurchaseNew() {
             setFeedback({ variant: "error", message: "Add items first." });
             return;
         }
+        const badBox = lines.find(
+            l => l.mode === "boxes" && (!(Number(l.piecesPerBox) >= 2) || !(l.boxes > 0))
+        );
+        if (badBox) {
+            setFeedback({
+                variant: "error",
+                message: `"${badBox.name}": enter number of boxes and pieces per box (2 or more).`,
+            });
+            return;
+        }
         setFeedback(null);
         const payload = {
             supplierId,
             note,
-            items: lines.map(l => ({
-                productId: l.productId,
-                qty: l.qty,
-                unitCost: l.unitCost,
-                ...(l.lineDiscount > 0 ? { lineDiscount: l.lineDiscount } : {}),
-                ...(l.newSalePrice ? { newSalePrice: l.newSalePrice } : {}),
-            })),
+            items: lines.map(l => {
+                const common = {
+                    productId: l.productId,
+                    ...(l.lineDiscount > 0 ? { lineDiscount: l.lineDiscount } : {}),
+                };
+                if (l.mode === "boxes") {
+                    const ppb = Number(l.piecesPerBox);
+                    return {
+                        ...common,
+                        boxes: l.boxes,
+                        piecesPerBox: ppb,
+                        boxCost: l.boxCost,
+                        // box sale price -> price of one piece
+                        ...(l.newBoxSalePrice ? { newSalePrice: round2(l.newBoxSalePrice / ppb) } : {}),
+                    };
+                }
+                return {
+                    ...common,
+                    qty: l.qty,
+                    unitCost: l.unitCost,
+                    ...(l.newSalePrice ? { newSalePrice: l.newSalePrice } : {}),
+                };
+            }),
         };
 
         const res = await apiFetch("/api/purchases", {
@@ -201,7 +273,8 @@ export default function PurchaseNew() {
             </div>
             {supplierId && supplierLabel && (
                 <p style={{ fontSize: 13, color: "#666" }}>
-                    Costs prefill from last purchase from <strong>{supplierLabel}</strong> when available.
+                    Cost prefills with the product's current purchase price. Products with a box size start in
+                    Boxes — stock and prices are always saved per single piece.
                 </p>
             )}
 
@@ -222,8 +295,8 @@ export default function PurchaseNew() {
                 <thead>
                     <tr>
                         <th>Item</th>
-                        <th>Qty</th>
-                        <th>Unit Cost</th>
+                        <th>Quantity</th>
+                        <th>Cost</th>
                         <th>Line Discount</th>
                         <th>New Sale Price</th>
                         <th className="num">Line Total</th>
@@ -232,30 +305,101 @@ export default function PurchaseNew() {
                 </thead>
                 <tbody>
                     {lines.map((l, i) => {
-                        const gross = l.qty * l.unitCost;
+                        const gross = lineGross(l);
                         const lineTotal = Math.max(0, gross - l.lineDiscount);
+                        const ppb = Number(l.piecesPerBox) || 0;
+                        const isBox = l.mode === "boxes";
                         return (
                         <tr key={i}>
-                            <td>{l.name}</td>
                             <td>
-                                <input
-                                    type="number" min={0.001} step={1}
-                                    value={l.qty}
-                                    onChange={e => {
-                                        const v = +e.target.value;
-                                        setLines(x => x.map((y, j) => (j === i ? { ...y, qty: v } : y)));
-                                    }}
-                                />
+                                {l.name}
+                                <div style={{ marginTop: 4 }}>
+                                    <select
+                                        value={l.mode}
+                                        aria-label="Enter as pieces or boxes"
+                                        onChange={e => {
+                                            const mode = e.target.value as Line["mode"];
+                                            if (mode === "boxes") {
+                                                const n = Number(l.piecesPerBox) || 0;
+                                                updLine(i, {
+                                                    mode,
+                                                    boxes: 1,
+                                                    boxCost: n ? boxPriceFromPiece(l.unitCost, n) : l.boxCost,
+                                                });
+                                            } else {
+                                                updLine(i, {
+                                                    mode,
+                                                    qty: Math.max(1, linePieces(l)),
+                                                    unitCost: ppb ? round2(l.boxCost / ppb) : l.unitCost,
+                                                });
+                                            }
+                                        }}
+                                    >
+                                        <option value="pieces">Pieces</option>
+                                        <option value="boxes">Boxes</option>
+                                    </select>
+                                </div>
                             </td>
                             <td>
-                                <input
-                                    type="number" min={0} step={1}
-                                    value={l.unitCost}
-                                    onChange={e => {
-                                        const v = +e.target.value;
-                                        setLines(x => x.map((y, j) => (j === i ? { ...y, unitCost: v } : y)));
-                                    }}
-                                />
+                                {isBox ? (
+                                    <div className="box-qty">
+                                        <input
+                                            type="number" min={0.001} step={1}
+                                            value={l.boxes}
+                                            aria-label="Number of boxes"
+                                            onChange={e => updLine(i, { boxes: +e.target.value })}
+                                            style={{ width: 70 }}
+                                        />
+                                        <span>box ×</span>
+                                        <input
+                                            type="number" min={2} step={1}
+                                            value={l.piecesPerBox}
+                                            placeholder="6"
+                                            aria-label="Pieces per box"
+                                            onChange={e =>
+                                                updLine(i, {
+                                                    piecesPerBox: e.target.value ? Math.floor(+e.target.value) : "",
+                                                })
+                                            }
+                                            style={{ width: 60 }}
+                                        />
+                                        <span>pcs</span>
+                                        <div className="hint-sm">= {linePieces(l)} pieces into stock</div>
+                                    </div>
+                                ) : (
+                                    <input
+                                        type="number" min={0.001} step={1}
+                                        value={l.qty}
+                                        onChange={e => updLine(i, { qty: +e.target.value })}
+                                    />
+                                )}
+                            </td>
+                            <td>
+                                {isBox ? (
+                                    <>
+                                        <input
+                                            type="number" min={0} step={1}
+                                            value={l.boxCost}
+                                            aria-label="Cost per box"
+                                            onChange={e => updLine(i, { boxCost: +e.target.value })}
+                                        />
+                                        <div className="hint-sm">
+                                            per box{ppb ? ` = Rs ${(l.boxCost / ppb).toFixed(2)} per piece` : ""}
+                                        </div>
+                                    </>
+                                ) : (
+                                    <input
+                                        type="number" min={0} step={1}
+                                        value={l.unitCost}
+                                        onChange={e => updLine(i, { unitCost: +e.target.value })}
+                                    />
+                                )}
+                                {l.supplierLastCost !== undefined &&
+                                    l.supplierLastCost !== (isBox && ppb ? round2(l.boxCost / ppb) : l.unitCost) && (
+                                    <div className="hint-sm">
+                                        Last from this supplier: {l.supplierLastCost.toFixed(2)} per piece
+                                    </div>
+                                )}
                             </td>
                             <td>
                                 <input
@@ -264,21 +408,39 @@ export default function PurchaseNew() {
                                     placeholder="0"
                                     onChange={e => {
                                         const v = e.target.value ? +e.target.value : 0;
-                                        const capped = Math.min(Math.max(0, v), gross);
-                                        setLines(x => x.map((y, j) => (j === i ? { ...y, lineDiscount: capped } : y)));
+                                        updLine(i, { lineDiscount: Math.min(Math.max(0, v), gross) });
                                     }}
                                 />
                             </td>
                             <td>
-                                <input
-                                    type="number" min={0} step={1}
-                                    value={l.newSalePrice ?? ""}
-                                    placeholder="(keep same)"
-                                    onChange={e => {
-                                        const v = e.target.value ? +e.target.value : undefined;
-                                        setLines(x => x.map((y, j) => (j === i ? { ...y, newSalePrice: v } : y)));
-                                    }}
-                                />
+                                {isBox ? (
+                                    <>
+                                        <input
+                                            type="number" min={0} step={1}
+                                            value={l.newBoxSalePrice ?? ""}
+                                            placeholder="(keep same)"
+                                            aria-label="Sale price per box"
+                                            onChange={e =>
+                                                updLine(i, { newBoxSalePrice: e.target.value ? +e.target.value : undefined })
+                                            }
+                                        />
+                                        <div className="hint-sm">
+                                            per box
+                                            {l.newBoxSalePrice && ppb
+                                                ? ` = Rs ${(l.newBoxSalePrice / ppb).toFixed(2)} per piece`
+                                                : ""}
+                                        </div>
+                                    </>
+                                ) : (
+                                    <input
+                                        type="number" min={0} step={1}
+                                        value={l.newSalePrice ?? ""}
+                                        placeholder="(keep same)"
+                                        onChange={e =>
+                                            updLine(i, { newSalePrice: e.target.value ? +e.target.value : undefined })
+                                        }
+                                    />
+                                )}
                             </td>
                             <td className="num">{lineTotal.toFixed(2)}</td>
                             <td>

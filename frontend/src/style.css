@@ -1894,3 +1894,78 @@ nav a {
     box-shadow: none;
   }
 }
+
+/* Products: bulk delete */
+.products-bulk-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0;
+  font-size: 14px;
+  color: #555;
+}
+.products-bulk-bar button.btn-danger:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.delete-list {
+  margin: 0;
+  padding-left: 18px;
+  max-height: 220px;
+  overflow: auto;
+  font-size: 14px;
+}
+
+/* Sales Summary: presets + graphs */
+.range-presets { display: flex; gap: 6px; flex-wrap: wrap; }
+.range-presets button { font-size: 13px; }
+.range-presets button.preset-active { outline: 2px solid #2a78d6; outline-offset: 1px; }
+.sales-charts { display: grid; gap: 16px; margin-top: 20px; }
+.chart-card {
+  background: #fcfcfb;
+  border: 1px solid #e0e0e0;
+  border-radius: 10px;
+  padding: 14px 16px 10px;
+  min-width: 0;
+}
+.chart-card h3 { margin: 0 0 10px; font-size: 15px; color: #0b0b0b; }
+.chart-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.chart-link { background: none; border: none; color: #2a78d6; cursor: pointer; font-size: 13px; padding: 0; }
+.chart-grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+.chart-table { margin-top: 12px; font-size: 13px; }
+.charts-note { color: #777; margin-top: 16px; }
+.chart-tip {
+  background: #fff;
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  padding: 8px 10px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+  font-size: 13px;
+  color: #0b0b0b;
+  min-width: 170px;
+}
+.chart-tip-title { font-weight: 600; margin-bottom: 4px; }
+.chart-tip-row { display: flex; align-items: center; gap: 6px; }
+.chart-tip-row b { margin-left: auto; }
+.chart-tip-key { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+.chart-tip-muted { color: #52514e; font-size: 12px; margin-top: 4px; }
+@media print { .range-presets { display: none; } }
+
+/* Products: stock value */
+.stock-value { margin: 4px 0 16px; }
+.stock-value-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin-bottom: 6px; }
+.sv-card { border: 1px solid #e0e0e0; border-radius: 10px; padding: 12px 14px; background: #fcfcfb; }
+.sv-label { font-size: 12px; color: #52514e; text-transform: uppercase; margin-bottom: 4px; }
+.sv-value { font-size: 22px; font-weight: 700; color: #0b0b0b; }
+.sv-sub { font-size: 12px; color: #52514e; margin-top: 2px; }
+.stock-value-note { color: #777; margin: 4px 0 12px; }
+
+/* Purchase: box entry */
+.box-qty { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.hint-sm { font-size: 12px; color: #6b7280; margin-top: 2px; width: 100%; }
+
+.box-badge { display: inline-block; margin-left: 6px; font-size: 11px; color: #52514e; background: #efeee9; border-radius: 4px; padding: 1px 6px; white-space: nowrap; }
+
+.stock-value-unlock { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.stock-value-unlock input { max-width: 220px; }
+.stock-value-err { color: #b91c1c; font-size: 13px; }

@@ -7,6 +7,8 @@ export const queryKeys = {
       [...queryKeys.sales.all, "detail", id] as const,
     summary: (from: string, to: string) =>
       [...queryKeys.sales.all, "summary", from, to] as const,
+    charts: (from: string, to: string) =>
+      [...queryKeys.sales.all, "charts", from, to] as const,
   },
   users: {
     all: ["users"] as const,

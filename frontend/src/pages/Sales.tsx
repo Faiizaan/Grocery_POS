@@ -95,7 +95,8 @@ export default function SalesPage() {
             }
             if (i >= 0) {
                 const next = [...prev];
-                next[i] = { ...next[i], quantity: nextQty };
+                // also refresh name/price/stock with the latest data we just got
+                next[i] = { ...next[i], product: p, quantity: nextQty };
                 return next;
             }
             return [...prev, { product: p, quantity: 1, lineDiscount: 0 }];
@@ -263,6 +264,8 @@ export default function SalesPage() {
             items: cart.map(ci => ({
                 productId: ci.product.id,
                 quantity: ci.quantity,
+                // price shown to the cashier; server rejects the sale if it no longer matches
+                unitPrice: ci.product.salePrice,
                 ...(ci.lineDiscount > 0 ? { discountValue: ci.lineDiscount } : {}),
             })),
             paidCash: cashAmount.toFixed(2),
@@ -281,6 +284,33 @@ export default function SalesPage() {
                 setFeedback({ variant: 'success', message: `Sale #${saleId} saved.` });
             }
         } catch (e) {
+            if (e instanceof ApiError && e.status === 409 && Array.isArray(e.body.priceChanges)) {
+                const changes = e.body.priceChanges as {
+                    productId: number;
+                    name: string;
+                    salePrice: string;
+                    taxRate: string;
+                    stock: string;
+                }[];
+                const byId = new Map(changes.map(c => [c.productId, c]));
+                setCart(prev =>
+                    prev.map(ci => {
+                        const c = byId.get(ci.product.id);
+                        if (!c) return ci;
+                        const product = {
+                            ...ci.product,
+                            name: c.name,
+                            salePrice: c.salePrice,
+                            taxRate: c.taxRate,
+                            stock: c.stock,
+                        };
+                        const gross = parseFloat(c.salePrice) * ci.quantity;
+                        return { ...ci, product, lineDiscount: Math.min(ci.lineDiscount, gross) };
+                    })
+                );
+                setCashTendered('');
+                cashRef.current?.focus();
+            }
             setFeedback({
                 variant: 'error',
                 message:

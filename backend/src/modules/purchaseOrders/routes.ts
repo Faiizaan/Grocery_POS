@@ -7,7 +7,13 @@ export const po = Router();
 
 const poInclude = {
   supplier: { select: { id: true, name: true } },
-  items: { include: { product: { select: { id: true, name: true, sku: true } } } },
+  items: {
+    include: {
+      product: {
+        select: { id: true, name: true, sku: true, price: true, piecesPerBox: true, isWeighted: true },
+      },
+    },
+  },
 };
 
 // POST /api/purchase-orders/generate — creates and saves a DRAFT order
@@ -19,7 +25,11 @@ po.post("/generate", async (req, res) => {
     note: z.string().optional(),
   });
   const parsed = schema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json(parsed.error.format());
+  if (!parsed.success) {
+    return res.status(400).json({
+      error: "Choose a supplier, days to analyze (1-90) and target days of stock (1-60).",
+    });
+  }
   const { supplierId, days, minDaysCover, note } = parsed.data;
 
   const supplier = await prisma.supplier.findUnique({ where: { id: supplierId } });
@@ -28,20 +38,21 @@ po.post("/generate", async (req, res) => {
   const since = new Date();
   since.setDate(since.getDate() - days);
 
-  const supplierProductIds = await prisma.supplierProduct.findMany({
-    where: { supplierId },
-    select: { productId: true },
-  });
-  const productIdSet = new Set(supplierProductIds.map((r) => r.productId));
-
-  if (productIdSet.size === 0) {
-    const fromPurchases = await prisma.purchaseItem.findMany({
+  // Products of this supplier = its price list + everything ever purchased from it.
+  // (Previously purchases were only used when the price list was empty, so products bought
+  // before the price list existed were silently left out of the order.)
+  const [supplierProductIds, fromPurchases] = await Promise.all([
+    prisma.supplierProduct.findMany({ where: { supplierId }, select: { productId: true } }),
+    prisma.purchaseItem.findMany({
       where: { purchase: { supplierId } },
       select: { productId: true },
       distinct: ["productId"],
-    });
-    for (const r of fromPurchases) productIdSet.add(r.productId as number);
-  }
+    }),
+  ]);
+  const productIdSet = new Set<number>([
+    ...supplierProductIds.map((r) => r.productId),
+    ...fromPurchases.map((r) => r.productId),
+  ]);
 
   if (productIdSet.size === 0) {
     return res.status(400).json({
@@ -66,8 +77,8 @@ po.post("/generate", async (req, res) => {
   }
 
   const products = await prisma.product.findMany({
-    where: { id: { in: productIds } },
-    select: { id: true, stock: true },
+    where: { id: { in: productIds }, deletedAt: null },
+    select: { id: true, stock: true, isWeighted: true, piecesPerBox: true },
   });
 
   const items = [];
@@ -77,7 +88,14 @@ po.post("/generate", async (req, res) => {
     const daily = recent / days;
     const targetStock = daily * minDaysCover;
     const current = Number(p.stock);
-    const need = Math.max(0, +(targetStock - current).toFixed(3));
+    const raw = Math.max(0, targetStock - current);
+    if (raw <= 0.0005) continue;
+    // You can't order 0.233 of a soap: round up to whole pieces, or whole boxes when the
+    // product has a box size. Items sold by weight keep decimals.
+    let need: number;
+    if (p.isWeighted) need = +raw.toFixed(3);
+    else if (p.piecesPerBox && p.piecesPerBox >= 2) need = Math.ceil(raw / p.piecesPerBox) * p.piecesPerBox;
+    else need = Math.ceil(raw);
     if (need > 0) {
       items.push({
         productId: p.id,
@@ -87,6 +105,15 @@ po.post("/generate", async (req, res) => {
       });
     }
   }
+
+  if (items.length === 0) {
+    return res.status(400).json({
+      error: `Nothing to reorder from ${supplier.name}: stock covers ${minDaysCover} days of sales for all its products (based on the last ${days} days).`,
+    });
+  }
+
+  // biggest need first
+  items.sort((a, b) => b.recentSales - a.recentSales);
 
   const draft = await prisma.purchaseOrder.create({
     data: {

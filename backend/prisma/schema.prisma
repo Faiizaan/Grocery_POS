@@ -53,14 +53,22 @@ model Product {
   salePrice         Decimal             @db.Decimal(10, 2) // <-- temporarily nullable
   taxRate           Decimal             @db.Decimal(5, 2)
   isWeighted        Boolean             @default(false)
+  // Pieces in one box/pack (e.g. 6). Stock and prices are always per single piece;
+  // this only lets purchases be entered per box.
+  piecesPerBox      Int?
   stock             Decimal             @default(0) @db.Decimal(12, 3)
   createdAt         DateTime            @default(now())
+  // Soft delete: set when a manager deletes the product. Hidden from lists/search/checkout,
+  // but kept so historical sales, purchases and reports stay intact.
+  deletedAt         DateTime?
   // relations...
   SaleItem          SaleItem[]
   InventoryTxn      InventoryTxn[]
   PurchaseItem      PurchaseItem[]
   PurchaseOrderItem PurchaseOrderItem[]
   supplierProducts  SupplierProduct[]
+
+  @@index([deletedAt])
 }
 
 model Sale {
@@ -103,10 +111,14 @@ model SaleItem {
   lineDiscount   Decimal @default(0) @db.Decimal(10, 2)
   unitCostAtSale Decimal @default(0) @db.Decimal(10, 2)
   costTotal      Decimal @default(0) @db.Decimal(10, 2)
+  // Product name at the time of sale, so renaming a product doesn't change old invoices.
+  productName    String?
   sale       Sale      @relation(fields: [saleId], references: [id])
   product    Product   @relation(fields: [productId], references: [id])
   Category   Category? @relation(fields: [categoryId], references: [id])
   categoryId Int?
+
+  @@index([categoryId])
 }
 
 model InventoryTxn {
@@ -177,6 +189,10 @@ model PurchaseItem {
   unitCost     Decimal  @db.Decimal(10, 2)
   lineDiscount Decimal  @default(0) @db.Decimal(10, 2)
   lineTotal    Decimal  @db.Decimal(10, 2)
+  // Set when the line was entered in boxes: qty = boxes x piecesPerBox, unitCost = boxCost / piecesPerBox
+  boxes        Decimal? @db.Decimal(12, 3)
+  piecesPerBox Int?
+  boxCost      Decimal? @db.Decimal(10, 2)
   purchase   Purchase @relation(fields: [purchaseId], references: [id])
   product    Product  @relation(fields: [productId], references: [id])
 }

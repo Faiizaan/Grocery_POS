@@ -1,3 +1,8 @@
+// The shop runs on Pakistan time: report day boundaries ("today", from/to dates) and
+// invoice numbers (SL-YYYYMMDD-####) use this zone, whatever the server/PC clock is set to.
+// Override with the TZ environment variable if ever needed.
+process.env.TZ = process.env.TZ || "Asia/Karachi";
+
 import express from "express";
 import cors from "cors";
 import morgan from "morgan";

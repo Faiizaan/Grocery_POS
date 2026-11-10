@@ -1,3 +1,4 @@
+import { formatDateTime } from "../lib/time";
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { usePurchasesListQuery } from "../hooks/queries";
@@ -62,7 +63,7 @@ export default function PurchasesList() {
                     }}
                 >
                     <div>
-                        <b>Purchase #{p.id}</b> — {new Date(p.createdAt).toLocaleString()}
+                        <b>Purchase #{p.id}</b> — {formatDateTime(p.createdAt)}
                     </div>
                     <div>Supplier: {p.supplier?.name || "-"}</div>
                     <div style={{ marginTop: 4 }}>

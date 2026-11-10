@@ -9,6 +9,24 @@ const toDec = (v: unknown) =>
 
 export const sales = Router();
 
+/** Arbitrary constant used as the Postgres advisory-lock key for invoice numbering. */
+const INVOICE_LOCK_KEY = 7_204_311;
+
+class PriceChangedError extends Error {
+  constructor(
+    public changes: {
+      productId: number;
+      name: string;
+      oldPrice: string;
+      salePrice: string;
+      taxRate: string;
+      stock: string;
+    }[]
+  ) {
+    super("Price changed");
+  }
+}
+
 /**
  * POST /api/sales
  * {
@@ -60,9 +78,41 @@ sales.post("/", async (req, res) => {
           salePrice: true,
           taxRate: true,
           stock: true,
+          deletedAt: true,
+          categoryId: true,
         },
       });
       const map = new Map(products.map((p) => [p.id, p]));
+
+      // If the cart was built with an old price/name (product edited after it was added
+      // or while the search result was cached), refuse and send back current values so
+      // the register can refresh instead of silently charging a different amount.
+      const priceChanges: {
+        productId: number;
+        name: string;
+        oldPrice: string;
+        salePrice: string;
+        taxRate: string;
+        stock: string;
+      }[] = [];
+      for (const r of items) {
+        const p = map.get(Number(r.productId));
+        if (!p || r.unitPrice === undefined || r.unitPrice === null || r.unitPrice === "") continue;
+        const sent = new Prisma.Decimal(r.unitPrice);
+        if (!sent.equals(p.salePrice)) {
+          priceChanges.push({
+            productId: p.id,
+            name: p.name,
+            oldPrice: sent.toFixed(2),
+            salePrice: new Prisma.Decimal(p.salePrice).toFixed(2),
+            taxRate: new Prisma.Decimal(p.taxRate).toString(),
+            stock: new Prisma.Decimal(p.stock).toString(),
+          });
+        }
+      }
+      if (priceChanges.length) {
+        throw new PriceChangedError(priceChanges);
+      }
 
       type Raw = {
         productId: number;
@@ -72,6 +122,8 @@ sales.post("/", async (req, res) => {
         lineDiscount: Prisma.Decimal;
         net: Prisma.Decimal;
         unitCostAtSale: Prisma.Decimal;
+        productName: string;
+        categoryId: number | null;
       };
       const raw: Raw[] = [];
       let totalLineDiscount = new Prisma.Decimal(0);
@@ -80,6 +132,7 @@ sales.post("/", async (req, res) => {
         const productId = Number(r.productId);
         const p = map.get(productId);
         if (!p) throw new Error(`Product ${productId} not found`);
+        if (p.deletedAt) throw new Error(`Product "${p.name}" has been deleted`);
         const qty = new Prisma.Decimal(r.quantity ?? 0);
         if (qty.lte(0)) throw new Error(`Invalid qty for product ${productId}`);
         if (new Prisma.Decimal(p.stock).lt(qty)) {
@@ -104,6 +157,8 @@ sales.post("/", async (req, res) => {
           lineDiscount: lineDisc,
           net,
           unitCostAtSale: new Prisma.Decimal(p.price),
+          productName: p.name,
+          categoryId: p.categoryId,
         });
       }
 
@@ -126,6 +181,8 @@ sales.post("/", async (req, res) => {
           lineDiscount: r.lineDiscount,
           lineTotal: lineGross,
           unitCostAtSale: r.unitCostAtSale,
+          productName: r.productName,
+          categoryId: r.categoryId,
           costTotal: r.unitCostAtSale.mul(r.qty),
         });
       }
@@ -142,18 +199,26 @@ sales.post("/", async (req, res) => {
       const changeDue = paidCash.sub(total);
 
       const today = new Date();
-      const from = new Date(today.toDateString());
-      const to = new Date(from);
-      to.setDate(to.getDate() + 1);
 
-      const countToday = await tx.sale.count({
-        where: { createdAt: { gte: from, lt: to } },
-      });
-      const seq = String(countToday + 1).padStart(4, "0");
       const y = today.getFullYear();
       const m = String(today.getMonth() + 1).padStart(2, "0");
       const d = String(today.getDate()).padStart(2, "0");
-      const invoiceCode = `SL-${y}${m}${d}-${seq}`;
+      const prefix = `SL-${y}${m}${d}-`;
+
+      // Two tills saving at the same moment used to get the same number (count + 1) and one
+      // sale failed. Lock invoice numbering for the rest of this transaction so saves take
+      // turns, and continue from the highest number used today (not a count, which also
+      // breaks if a row is ever removed).
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${INVOICE_LOCK_KEY})`;
+      const lastToday = await tx.sale.findFirst({
+        where: { invoiceCode: { startsWith: prefix } },
+        orderBy: { invoiceCode: "desc" },
+        select: { invoiceCode: true },
+      });
+      const lastSeq = lastToday?.invoiceCode
+        ? Number(lastToday.invoiceCode.slice(prefix.length)) || 0
+        : 0;
+      const invoiceCode = `${prefix}${String(lastSeq + 1).padStart(4, "0")}`;
 
       const discountPercent =
         subtotal.add(totalLineDiscount).gt(0) && totalLineDiscount.gt(0)
@@ -198,6 +263,15 @@ sales.post("/", async (req, res) => {
 
     res.json({ ok: true, sale });
   } catch (e: unknown) {
+    if (e instanceof PriceChangedError) {
+      const names = e.changes
+        .map((c) => `${c.name}: Rs ${c.oldPrice} → Rs ${c.salePrice}`)
+        .join(", ");
+      return res.status(409).json({
+        error: `Price changed since the item was added (${names}). Cart updated — please check the total and try again.`,
+        priceChanges: e.changes,
+      });
+    }
     const msg = e instanceof Error ? e.message : "Failed to save sale";
     console.error(e);
     res.status(400).json({ error: msg });

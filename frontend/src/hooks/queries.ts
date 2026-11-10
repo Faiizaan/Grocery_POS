@@ -69,6 +69,26 @@ export function useSalesSummaryQuery(from: string, to: string, enabled = true) {
   });
 }
 
+export type SalesChartsData = {
+  from: string;
+  to: string;
+  granularity: "day" | "month";
+  series: { key: string; invoices: number; sales: number; cost: number; profit: number }[];
+  topProducts: { productId: number; name: string; qty: number; sales: number; profit: number }[];
+  hourly: { hour: number; invoices: number; sales: number }[];
+};
+
+export function useSalesChartsQuery(from: string, to: string) {
+  return useQuery({
+    queryKey: queryKeys.sales.charts(from, to),
+    queryFn: () => {
+      const params = new URLSearchParams({ from, to });
+      return getJson<SalesChartsData>(`/api/sales-summary/charts?${params}`);
+    },
+    enabled: !!from && !!to,
+  });
+}
+
 export function useVoidSaleMutation() {
   const queryClient = useQueryClient();
   return useMutation({
@@ -268,11 +288,14 @@ export function useProductSearchQuery(q: string) {
         `/api/products/search?q=${encodeURIComponent(trimmed)}`
       ),
     enabled: trimmed.length > 0,
+    // Always fetch fresh results so price/name edits show up immediately at the till.
+    staleTime: 0,
   });
 }
 
 export type ProductListRow = ProductSearchHit & {
   price: string;
+  piecesPerBox?: number | null;
 };
 
 export function useProductsListQuery(
@@ -387,6 +410,9 @@ export type CategoryReportRow = {
   qty: number;
   revenue: number;
   tax: number;
+  cost?: number;
+  profit?: number;
+  margin?: number;
 };
 
 export type PurchaseOrderRow = {
@@ -401,7 +427,14 @@ export type PurchaseOrderRow = {
     suggestedQty: string;
     currentStock: string;
     recentSales: string;
-    product: { id: number; name: string; sku: string };
+    product: {
+      id: number;
+      name: string;
+      sku: string;
+      price?: string;
+      piecesPerBox?: number | null;
+      isWeighted?: boolean;
+    };
   }[];
 };
 

@@ -1,3 +1,4 @@
+import { formatDateTime } from "../lib/time";
 import { Link, useParams } from "react-router-dom";
 import { useSupplierDetailQuery } from "../hooks/queries";
 
@@ -57,7 +58,7 @@ export default function SupplierDetail() {
               <td className="num">Rs {(+p.latestProductCost).toFixed(2)}</td>
               <td className="num">Rs {(+p.salePrice).toFixed(2)}</td>
               <td className="num">{(+p.stock).toFixed(3)}</td>
-              <td>{new Date(p.lastPurchasedAt).toLocaleString()}</td>
+              <td>{formatDateTime(p.lastPurchasedAt)}</td>
             </tr>
           ))}
           {products.length === 0 && (

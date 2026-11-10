@@ -3,14 +3,10 @@ import { StatusLine } from "../components/StatusLine";
 import { useSalesSummaryQuery } from "../hooks/queries";
 import { downloadCsv } from "../lib/csvExport";
 import { ApiError } from "../lib/apiJson";
+import { storeTodayYmd, storeYmdDaysAgo } from "../lib/time";
+import SalesCharts from "../components/SalesCharts";
 
-function todayISO() {
-    const d = new Date();
-    const yyyy = d.getFullYear();
-    const mm = String(d.getMonth() + 1).padStart(2, "0");
-    const dd = String(d.getDate()).padStart(2, "0");
-    return `${yyyy}-${mm}-${dd}`;
-}
+const todayISO = storeTodayYmd;
 
 export default function SalesSummary() {
     const [from, setFrom] = useState(todayISO());
@@ -76,6 +72,29 @@ export default function SalesSummary() {
                     {loading ? "Loading…" : "Get Summary"}
                 </button>
 
+                <div className="range-presets">
+                    {[
+                        { label: "Today", from: storeTodayYmd(), to: storeTodayYmd() },
+                        { label: "Last 7 days", from: storeYmdDaysAgo(6), to: storeTodayYmd() },
+                        { label: "Last 30 days", from: storeYmdDaysAgo(29), to: storeTodayYmd() },
+                        { label: "This month", from: storeTodayYmd().slice(0, 8) + "01", to: storeTodayYmd() },
+                        { label: "Last 12 months", from: storeYmdDaysAgo(364), to: storeTodayYmd() },
+                    ].map((p) => (
+                        <button
+                            key={p.label}
+                            type="button"
+                            className={activeRange.from === p.from && activeRange.to === p.to ? "preset-active" : undefined}
+                            onClick={() => {
+                                setFrom(p.from);
+                                setTo(p.to);
+                                setActiveRange({ from: p.from, to: p.to });
+                            }}
+                        >
+                            {p.label}
+                        </button>
+                    ))}
+                </div>
+
                 <button type="button" onClick={() => window.print()} disabled={!data} title="Print this summary">
                     Print
                 </button>
@@ -115,6 +134,8 @@ export default function SalesSummary() {
                     <Card label="Profit Margin" value={`${data.profitMargin.toFixed(2)}%`} />
                 </div>
             )}
+
+            {data && <SalesCharts from={activeRange.from} to={activeRange.to} />}
 
             {!loading && !data && !err && (
                 <div style={{ color: "#777", marginTop: 8 }}>

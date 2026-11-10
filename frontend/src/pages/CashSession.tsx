@@ -1,3 +1,4 @@
+import { formatDateTime } from "../lib/time";
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { StatusLine } from "../components/StatusLine";
@@ -44,7 +45,7 @@ function fmtRs(v: string | number, opts?: { showPlus?: boolean }) {
 }
 
 function fmtDt(iso: string) {
-  return new Date(iso).toLocaleString();
+  return formatDateTime(iso);
 }
 
 export default function CashSessionPage() {

@@ -48,7 +48,7 @@ suppliers.get("/:id", async (req, res) => {
   if (!supplier) return res.status(404).json({ error: "Not found" });
 
   const supplierProducts = await prisma.supplierProduct.findMany({
-    where: { supplierId: id },
+    where: { supplierId: id, product: { deletedAt: null } },
     include: {
       product: {
         select: {

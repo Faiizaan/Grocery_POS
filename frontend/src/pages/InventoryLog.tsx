@@ -1,3 +1,4 @@
+import { formatDateTime } from "../lib/time";
 import { useEffect, useState } from "react";
 import { PaginationBar } from "../components/PaginationBar";
 import { apiFetch } from "../lib/api";
@@ -114,7 +115,7 @@ export default function InventoryLog() {
                         return (
                         <tr key={t.id}>
                             <td>{t.id}</td>
-                            <td>{new Date(t.createdAt).toLocaleString()}</td>
+                            <td>{formatDateTime(t.createdAt)}</td>
                             <td>{t.product?.name ?? "-"}</td>
                             <td>{t.product?.sku ?? "-"}</td>
                             <td>{t.product?.barcode || "-"}</td>

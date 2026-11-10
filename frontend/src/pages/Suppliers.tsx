@@ -1,3 +1,4 @@
+import { formatDateTime } from "../lib/time";
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { StatusLine } from "../components/StatusLine";
@@ -148,7 +149,7 @@ export default function Suppliers() {
                 <Link to={`/suppliers/${s.id}`}>{s.name}</Link>
               </td>
               <td>{s.phone || "—"}</td>
-              <td>{new Date(s.createdAt).toLocaleString()}</td>
+              <td>{formatDateTime(s.createdAt)}</td>
               <td>
                 <Link to={`/suppliers/${s.id}`} className="btn btn-outline">
                   View products

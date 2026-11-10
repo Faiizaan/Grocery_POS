@@ -7,14 +7,27 @@ export const purchases = Router();
 const PurchaseSchema = z.object({
   supplierId: z.number().int().positive(),
   items: z.array(
-    z.object({
-      productId: z.number(),
-      qty: z.number().positive(),
-      unitCost: z.number().nonnegative(),
-      lineDiscount: z.number().nonnegative().optional(),
-      newSalePrice: z.number().nonnegative().optional(),
-    })
-  ),
+    z
+      .object({
+        productId: z.number(),
+        // Either pieces (qty + unitCost per piece) ...
+        qty: z.number().positive().optional(),
+        unitCost: z.number().nonnegative().optional(),
+        // ... or boxes (boxes x piecesPerBox pieces, boxCost per box)
+        boxes: z.number().positive().optional(),
+        piecesPerBox: z.number().int().min(2).max(1000).optional(),
+        boxCost: z.number().nonnegative().optional(),
+        lineDiscount: z.number().nonnegative().optional(),
+        newSalePrice: z.number().nonnegative().optional(), // per piece
+      })
+      .refine(
+        (it) =>
+          it.boxes !== undefined
+            ? it.piecesPerBox !== undefined && it.boxCost !== undefined
+            : it.qty !== undefined && it.unitCost !== undefined,
+        { message: "Each line needs qty + unitCost, or boxes + piecesPerBox + boxCost" }
+      )
+  ).min(1),
   note: z.string().optional(),
 });
 
@@ -49,14 +62,40 @@ purchases.post("/", async (req, res) => {
   const supplier = await prisma.supplier.findUnique({ where: { id: supplierId } });
   if (!supplier) return res.status(400).json({ error: "Supplier not found" });
 
+  const productIds = [...new Set(items.map((it) => it.productId))];
+  const liveProducts = await prisma.product.findMany({
+    where: { id: { in: productIds }, deletedAt: null },
+    select: { id: true },
+  });
+  if (liveProducts.length !== productIds.length) {
+    return res
+      .status(400)
+      .json({ error: "One or more products were deleted or not found. Remove them and try again." });
+  }
+
   let subtotalPre = 0;
   let totalLineDiscount = 0;
   const lineData = items.map((it) => {
-    const gross = it.qty * it.unitCost;
+    const byBox = it.boxes !== undefined;
+    // Stock and cost are always kept per piece. For boxes, the line total uses the box
+    // price directly so it stays exact (1 box @ 220 = 220, not 6 x 36.67 = 220.02).
+    const qty = byBox ? +(it.boxes! * it.piecesPerBox!).toFixed(3) : it.qty!;
+    const unitCost = byBox ? +(it.boxCost! / it.piecesPerBox!).toFixed(2) : it.unitCost!;
+    const gross = byBox ? it.boxes! * it.boxCost! : qty * unitCost;
     const lineDisc = Math.min(Math.max(it.lineDiscount ?? 0, 0), gross);
     subtotalPre += gross;
     totalLineDiscount += lineDisc;
-    return { ...it, lineDisc, lineTotal: +(gross - lineDisc).toFixed(2) };
+    return {
+      productId: it.productId,
+      qty,
+      unitCost,
+      newSalePrice: it.newSalePrice,
+      boxes: byBox ? it.boxes : undefined,
+      piecesPerBox: byBox ? it.piecesPerBox : undefined,
+      boxCost: byBox ? it.boxCost : undefined,
+      lineDisc,
+      lineTotal: +(gross - lineDisc).toFixed(2),
+    };
   });
 
   const subtotal = +(subtotalPre - totalLineDiscount).toFixed(2);
@@ -87,6 +126,9 @@ purchases.post("/", async (req, res) => {
             unitCost: it.unitCost,
             lineDiscount: it.lineDisc,
             lineTotal: it.lineTotal,
+            boxes: it.boxes,
+            piecesPerBox: it.piecesPerBox,
+            boxCost: it.boxCost,
           },
         });
 
@@ -96,6 +138,8 @@ purchases.post("/", async (req, res) => {
             stock: { increment: it.qty },
             price: it.unitCost,
             ...(it.newSalePrice !== undefined ? { salePrice: it.newSalePrice } : {}),
+            // remember the box size for next time
+            ...(it.piecesPerBox !== undefined ? { piecesPerBox: it.piecesPerBox } : {}),
           },
         });
 

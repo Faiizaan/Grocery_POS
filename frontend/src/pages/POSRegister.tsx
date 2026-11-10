@@ -23,7 +23,21 @@ export default function POSRegister() {
     taxRate: "0",
     isWeighted: false,
     stock: "0",
+    piecesPerBox: "",
   });
+
+  // Optional helper: enter box prices, per-piece prices are calculated from them.
+  const [boxCost, setBoxCost] = useState("");
+  const [boxSale, setBoxSale] = useState("");
+  const ppb = Number(form.piecesPerBox) || 0;
+  const applyBoxPrices = (cost: string, sale: string, pieces: number) => {
+    if (pieces < 2) return;
+    setForm((f) => ({
+      ...f,
+      ...(cost !== "" ? { price: (Number(cost) / pieces).toFixed(2) } : {}),
+      ...(sale !== "" ? { salePrice: (Number(sale) / pieces).toFixed(2) } : {}),
+    }));
+  };
 
   const [feedback, setFeedback] = useState<PageFeedback>(null);
   const [loading, setLoading] = useState(false);
@@ -77,7 +91,13 @@ export default function POSRegister() {
         taxRate: Number(form.taxRate || 0),
         isWeighted: Boolean(form.isWeighted),
         stock: Number(form.stock || 0),
+        piecesPerBox: form.piecesPerBox ? Math.floor(Number(form.piecesPerBox)) : null,
       };
+      if (payload.piecesPerBox !== null && payload.piecesPerBox < 2) {
+        setFeedback({ variant: "error", message: "Pieces per box must be 2 or more (or leave it empty)." });
+        setLoading(false);
+        return;
+      }
       if (form.categoryId === "") {
         setFeedback({ variant: "error", message: "Category is required." });
         setLoading(false);
@@ -117,7 +137,10 @@ export default function POSRegister() {
           taxRate: "0",
           isWeighted: false,
           stock: "0",
+          piecesPerBox: "",
         });
+        setBoxCost("");
+        setBoxSale("");
       }
     } catch {
       setFeedback({ variant: "error", message: "Failed to create product (network)." });
@@ -220,10 +243,63 @@ export default function POSRegister() {
           </div>
         </div>
 
+        {/* Row: Box helper */}
+        <div className="grid-3">
+          <div className="field">
+            <label>Pieces per box (optional)</label>
+            <input
+              type="number"
+              min={2}
+              step={1}
+              placeholder="e.g. 6"
+              value={form.piecesPerBox}
+              onChange={(e) => {
+                set("piecesPerBox", e.target.value);
+                applyBoxPrices(boxCost, boxSale, Number(e.target.value) || 0);
+              }}
+            />
+          </div>
+          {ppb >= 2 && (
+            <>
+              <div className="field">
+                <label>Box purchase price</label>
+                <input
+                  type="number"
+                  min={0}
+                  step={1}
+                  value={boxCost}
+                  onChange={(e) => {
+                    setBoxCost(e.target.value);
+                    applyBoxPrices(e.target.value, "", ppb);
+                  }}
+                />
+              </div>
+              <div className="field">
+                <label>Box sale price</label>
+                <input
+                  type="number"
+                  min={0}
+                  step={1}
+                  value={boxSale}
+                  onChange={(e) => {
+                    setBoxSale(e.target.value);
+                    applyBoxPrices("", e.target.value, ppb);
+                  }}
+                />
+              </div>
+            </>
+          )}
+        </div>
+        {ppb >= 2 && (
+          <p className="hint-sm" style={{ marginTop: -6 }}>
+            Prices below are per single piece (box price ÷ {ppb}). Stock is counted in pieces.
+          </p>
+        )}
+
         {/* Row: Purchase / Sale / Tax */}
         <div className="grid-3">
           <div className="field">
-            <label>Purchase Price</label>
+            <label>Purchase Price (per piece)</label>
             <input
               type="number"
               min={0}
@@ -233,7 +309,7 @@ export default function POSRegister() {
             />
           </div>
           <div className="field">
-            <label>Sale Price</label>
+            <label>Sale Price (per piece)</label>
             <input
               type="number"
               min={0}
@@ -258,7 +334,7 @@ export default function POSRegister() {
         {/* Row: Opening stock / Weighted */}
         <div className="grid-2">
           <div className="field">
-            <label>Opening Stock</label>
+            <label>Opening Stock (pieces)</label>
             <input
               type="number"
               min={0}

@@ -1,3 +1,4 @@
+import { formatDateTime } from "../lib/time";
 import { useEffect } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import { useLocation, useParams, useSearchParams } from "react-router-dom";
@@ -49,13 +50,14 @@ export default function SaleInvoice() {
       <div style={{ textAlign: "center", marginTop: 40 }}>Sale not found</div>
     );
 
-  const date = new Date(sale.createdAt as string).toLocaleString();
+  const date = formatDateTime(sale.createdAt as string);
   const isVoided = !!sale.voidedAt;
   const items = sale.items as Array<{
     qty: string;
     unitPrice: string;
     lineTotal: string;
     product?: { name?: string };
+    productName?: string | null;
   }>;
   const totalQty = items.reduce((sum, it) => sum + Number(it.qty || 0), 0);
   const paidCash = Number(sale.paidCash || 0);
@@ -85,7 +87,7 @@ export default function SaleInvoice() {
           <p className="store-line">STRN # {STORE_STRN}</p>
           {isVoided && (
             <p className="void-banner">
-              VOIDED — {new Date(sale.voidedAt as string).toLocaleString()}
+              VOIDED — {formatDateTime(sale.voidedAt as string)}
             </p>
           )}
         </header>
@@ -136,7 +138,7 @@ export default function SaleInvoice() {
             {items.map((it, i) => (
               <tr key={i}>
                 <td className="col-num">{i + 1}</td>
-                <td className="col-item">{it.product?.name ?? "Unknown"}</td>
+                <td className="col-item">{it.productName ?? it.product?.name ?? "Unknown"}</td>
                 <td className="col-qty">{+it.qty}</td>
                 <td className="col-price">{money(it.unitPrice)}</td>
                 <td className="col-total">{money(it.lineTotal)}</td>

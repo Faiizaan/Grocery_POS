@@ -1,210 +1,28 @@
 import { Router } from "express";
-import { Prisma } from "@prisma/client";
 import { prisma } from "../../db";
+import { buildCostLookup, lineCost } from "../../lib/costBasis";
 
 const router = Router();
 
 const YMD = /^\d{4}-\d{2}-\d{2}$/;
-const startOfDayUTC = (ymd: string) => new Date(`${ymd}T00:00:00.000Z`);
-const endOfDayUTC = (ymd: string) => new Date(`${ymd}T23:59:59.999Z`);
+// Local day boundaries, consistent with the other report endpoints.
+const startOfDayLocal = (ymd: string) => {
+  const [y, m, d] = ymd.split("-").map(Number);
+  return new Date(y, m - 1, d, 0, 0, 0, 0);
+};
+const endOfDayLocal = (ymd: string) => {
+  const [y, m, d] = ymd.split("-").map(Number);
+  return new Date(y, m - 1, d, 23, 59, 59, 999);
+};
 
-type BasisMode = "latest" | "avg";
-
-async function getCostBasis(productId: number, basis: BasisMode) {
-  // If you have no purchases yet, fall back to Product.price.
-  if (basis === "latest") {
-    const last = await prisma.purchaseItem.findFirst({
-      where: { productId },
-      orderBy: [{ purchase: { createdAt: "desc" } }, { id: "desc" }],
-      select: { unitCost: true, purchase: { select: { createdAt: true } } },
-    });
-
-    return {
-      basis: last?.unitCost ?? null,
-      basisDate: last?.purchase?.createdAt ?? null,
-      mode: "latest" as const,
-    };
-  }
-
-  // Weighted average = sum(qty*unitCost) / sum(qty)
-  const rows = await prisma.purchaseItem.findMany({
-    where: { productId },
-    select: { qty: true, unitCost: true },
-  });
-
-  let qtySum = new Prisma.Decimal(0);
-  let costSum = new Prisma.Decimal(0);
-
-  for (const r of rows) {
-    qtySum = qtySum.add(r.qty);
-    costSum = costSum.add(r.unitCost.mul(r.qty));
-  }
-
-  const avg = qtySum.greaterThan(0) ? costSum.div(qtySum) : null;
-
-  return {
-    basis: avg,
-    basisDate: null,
-    mode: "avg" as const,
-  };
-}
-
-/**
- * GET /api/product-analytics/:productId/summary
- * Query:
- *  - from=YYYY-MM-DD&to=YYYY-MM-DD (optional)
- *  - basis=latest|avg (optional, default latest)
- *
- * Profit ignores tax:
- *  revenue = sum(qty * unitPrice)
- *  cost = qtySold * costBasis
- *  profit = revenue - cost
- *  profitMargin% = profit / revenue * 100
- */
-router.get("/:productId/summary", async (req, res) => {
-  const productId = Number(req.params.productId);
-  if (!Number.isFinite(productId))
-    return res.status(400).json({ error: "Invalid productId" });
-
-  const basis: BasisMode = req.query.basis === "avg" ? "avg" : "latest";
-
+function parseRange(query: Record<string, unknown>) {
   const fromStr =
-    typeof req.query.from === "string" && YMD.test(req.query.from)
-      ? req.query.from
-      : null;
+    typeof query.from === "string" && YMD.test(query.from) ? query.from : null;
   const toStr =
-    typeof req.query.to === "string" && YMD.test(req.query.to)
-      ? req.query.to
-      : null;
-
-  const from = fromStr ? startOfDayUTC(fromStr) : null;
-  const to = toStr ? endOfDayUTC(toStr) : null;
-
-  try {
-    const product = await prisma.product.findUnique({
-      where: { id: productId },
-      select: {
-        id: true,
-        name: true,
-        sku: true,
-        barcode: true,
-        price: true, // fallback cost if no purchase history
-        salePrice: true,
-        stock: true,
-        taxRate: true,
-        isWeighted: true,
-        createdAt: true,
-      },
-    });
-
-    if (!product) return res.status(404).json({ error: "Product not found" });
-
-    const dateFilter = {
-      sale: {
-        voidedAt: null,
-        ...(from || to
-          ? {
-              createdAt: {
-                ...(from ? { gte: from } : {}),
-                ...(to ? { lte: to } : {}),
-              },
-            }
-          : {}),
-      },
-    };
-
-    // Pull sale lines (minimal) to compute revenue + qtySold ignoring tax
-    const saleLines = await prisma.saleItem.findMany({
-      where: { productId, ...dateFilter },
-      select: {
-        qty: true,
-        unitPrice: true, // ex tax
-        sale: { select: { createdAt: true } },
-      },
-    });
-
-    let qtySold = new Prisma.Decimal(0);
-    let revenue = new Prisma.Decimal(0);
-
-    for (const r of saleLines) {
-      qtySold = qtySold.add(r.qty);
-      revenue = revenue.add(r.unitPrice.mul(r.qty));
-    }
-
-    // Cost basis from purchases (latest or weighted avg)
-    const cb = await getCostBasis(productId, basis);
-
-    const costBasis = cb.basis ?? product.price; // fallback to Product.price
-    const cost = qtySold.mul(costBasis);
-    const profit = revenue.sub(cost);
-    const profitMargin = revenue.greaterThan(0)
-      ? profit.div(revenue).mul(100)
-      : new Prisma.Decimal(0);
-
-    return res.json({
-      product: {
-        ...product,
-        price: product.price.toFixed(2),
-        salePrice: product.salePrice.toFixed(2),
-        stock: product.stock.toFixed(3),
-        taxRate: product.taxRate.toFixed(2),
-      },
-      totals: {
-        qtySold: qtySold.toFixed(3),
-        revenue: revenue.toFixed(2), // ✅ ex tax
-        costBasis: costBasis.toFixed(2), // ✅ per unit basis (latest/avg)
-        cost: cost.toFixed(2),
-        profit: profit.toFixed(2),
-        profitMargin: profitMargin.toFixed(2), // %
-      },
-      costBasisMeta: {
-        mode: cb.mode,
-        basisDate: cb.basisDate ? cb.basisDate.toISOString() : null,
-        note:
-          cb.mode === "latest"
-            ? "Using latest purchase unit cost (fallback to Product.price if no purchases)."
-            : "Using weighted average purchase unit cost (fallback to Product.price if no purchases).",
-      },
-      filter: { from: fromStr, to: toStr },
-    });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: "Failed to load product summary" });
-  }
-});
-
-/**
- * GET /api/product-analytics/:productId/sales
- * Same filters + basis.
- * Returns per-sale-line profit using the same cost basis (ignoring tax).
- */
-router.get("/:productId/sales", async (req, res) => {
-  const productId = Number(req.params.productId);
-  if (!Number.isFinite(productId))
-    return res.status(400).json({ error: "Invalid productId" });
-
-  const basis: BasisMode = req.query.basis === "avg" ? "avg" : "latest";
-
-  const limitRaw = Number(req.query.limit ?? 200);
-  const offsetRaw = Number(req.query.offset ?? 0);
-  const take = Number.isFinite(limitRaw)
-    ? Math.min(Math.max(limitRaw, 1), 500)
-    : 200;
-  const skip = Number.isFinite(offsetRaw) ? Math.max(offsetRaw, 0) : 0;
-
-  const fromStr =
-    typeof req.query.from === "string" && YMD.test(req.query.from)
-      ? req.query.from
-      : null;
-  const toStr =
-    typeof req.query.to === "string" && YMD.test(req.query.to)
-      ? req.query.to
-      : null;
-
-  const from = fromStr ? startOfDayUTC(fromStr) : null;
-  const to = toStr ? endOfDayUTC(toStr) : null;
-
-  const dateFilter = {
+    typeof query.to === "string" && YMD.test(query.to) ? query.to : null;
+  const from = fromStr ? startOfDayLocal(fromStr) : null;
+  const to = toStr ? endOfDayLocal(toStr) : null;
+  const where = {
     sale: {
       voidedAt: null,
       ...(from || to
@@ -217,71 +35,171 @@ router.get("/:productId/sales", async (req, res) => {
         : {}),
     },
   };
+  return { fromStr, toStr, where };
+}
+
+const lineSelect = {
+  id: true,
+  productId: true,
+  qty: true,
+  unitPrice: true,
+  taxRate: true,
+  lineDiscount: true,
+  lineTotal: true,
+  unitCostAtSale: true,
+  costTotal: true,
+  sale: { select: { id: true, createdAt: true, invoiceCode: true, total: true } },
+} as const;
+
+/** Revenue ex tax for one line = unitPrice * qty - lineDiscount (price as charged at sale time). */
+const lineRevenue = (l: { qty: unknown; unitPrice: unknown; lineDiscount: unknown }) =>
+  Number(l.unitPrice) * Number(l.qty) - (Number(l.lineDiscount) || 0);
+
+/**
+ * GET /api/product-analytics/:productId/summary?from=YYYY-MM-DD&to=YYYY-MM-DD
+ *
+ * Profit uses the prices that applied on each sale:
+ *  revenue = what the customer was charged (ex tax, after line discount)
+ *  cost    = purchase cost captured at sale time (see lib/costBasis)
+ * Editing the product's purchase/sale price later does not rewrite past profit.
+ */
+router.get("/:productId/summary", async (req, res) => {
+  const productId = Number(req.params.productId);
+  if (!Number.isFinite(productId))
+    return res.status(400).json({ error: "Invalid productId" });
+
+  const { fromStr, toStr, where } = parseRange(req.query);
 
   try {
-    // Cost basis once for all rows
+    const product = await prisma.product.findUnique({
+      where: { id: productId },
+      select: {
+        id: true,
+        name: true,
+        sku: true,
+        barcode: true,
+        price: true,
+        salePrice: true,
+        stock: true,
+        taxRate: true,
+        isWeighted: true,
+        createdAt: true,
+        deletedAt: true,
+      },
+    });
+    if (!product) return res.status(404).json({ error: "Product not found" });
+
+    const lines = await prisma.saleItem.findMany({
+      where: { productId, ...where },
+      select: lineSelect,
+    });
+
+    const lookup = await buildCostLookup([productId]);
+    const fallback = Number(product.price) || 0;
+
+    let qtySold = 0;
+    let revenueExTax = 0;
+    let revenueInclTax = 0;
+    let cost = 0;
+    let snapshotLines = 0;
+    for (const l of lines) {
+      qtySold += Number(l.qty);
+      revenueExTax += lineRevenue(l);
+      revenueInclTax += Number(l.lineTotal);
+      cost += lineCost(l, l.sale.createdAt, fallback, lookup);
+      if (Number(l.costTotal) > 0 || Number(l.unitCostAtSale) > 0) snapshotLines++;
+    }
+    const profit = revenueExTax - cost;
+    const profitMargin = revenueExTax > 0 ? (profit / revenueExTax) * 100 : 0;
+
+    return res.json({
+      product: {
+        ...product,
+        price: product.price.toFixed(2),
+        salePrice: product.salePrice.toFixed(2),
+        stock: product.stock.toFixed(3),
+        taxRate: product.taxRate.toFixed(2),
+      },
+      totals: {
+        qtySold: qtySold.toFixed(3),
+        revenueExTax: revenueExTax.toFixed(2),
+        revenueInclTax: revenueInclTax.toFixed(2),
+        revenue: revenueExTax.toFixed(2), // kept for backwards compatibility
+        cost: cost.toFixed(2),
+        avgUnitCost: qtySold > 0 ? (cost / qtySold).toFixed(2) : "0.00",
+        profit: profit.toFixed(2),
+        profitMargin: profitMargin.toFixed(2),
+      },
+      costBasisMeta: {
+        lines: lines.length,
+        snapshotLines,
+        note: "Cost per sale = purchase cost recorded at the time of sale. Older sales without a snapshot use the purchase cost in effect on that date.",
+      },
+      filter: { from: fromStr, to: toStr },
+    });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Failed to load product summary" });
+  }
+});
+
+/**
+ * GET /api/product-analytics/:productId/sales?from&to&limit&offset
+ * Per-sale-line revenue / cost / profit using the prices of that sale.
+ */
+router.get("/:productId/sales", async (req, res) => {
+  const productId = Number(req.params.productId);
+  if (!Number.isFinite(productId))
+    return res.status(400).json({ error: "Invalid productId" });
+
+  const limitRaw = Number(req.query.limit ?? 200);
+  const offsetRaw = Number(req.query.offset ?? 0);
+  const take = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 500) : 200;
+  const skip = Number.isFinite(offsetRaw) ? Math.max(offsetRaw, 0) : 0;
+
+  const { where } = parseRange(req.query);
+
+  try {
     const product = await prisma.product.findUnique({
       where: { id: productId },
       select: { price: true },
     });
     if (!product) return res.status(404).json({ error: "Product not found" });
 
-    const cb = await getCostBasis(productId, basis);
-    const costBasis = cb.basis ?? product.price;
-
     const rows = await prisma.saleItem.findMany({
-      where: { productId, ...dateFilter },
+      where: { productId, ...where },
       orderBy: { id: "desc" },
       take,
       skip,
-      select: {
-        id: true,
-        qty: true,
-        unitPrice: true,
-        taxRate: true,
-        lineTotal: true, // still returned if you want to show it, but profit ignores it
-        sale: {
-          select: { id: true, createdAt: true, invoiceCode: true, total: true },
-        },
-      },
+      select: lineSelect,
     });
 
-    const out = rows.map((r) => {
-      const revenueExTax = r.unitPrice.mul(r.qty);
-      const costTotal = costBasis.mul(r.qty);
-      const profit = revenueExTax.sub(costTotal);
+    const lookup = await buildCostLookup([productId]);
+    const fallback = Number(product.price) || 0;
 
+    const out = rows.map((r) => {
+      const revenueExTax = lineRevenue(r);
+      const costTotal = lineCost(r, r.sale.createdAt, fallback, lookup);
+      const qty = Number(r.qty);
       return {
         id: r.id,
         qty: r.qty.toFixed(3),
         unitPrice: r.unitPrice.toFixed(2),
         taxRate: r.taxRate.toFixed(2),
+        lineDiscount: r.lineDiscount.toFixed(2),
         lineTotal: r.lineTotal.toFixed(2),
-
+        unitCost: (qty > 0 ? costTotal / qty : 0).toFixed(2),
         revenueExTax: revenueExTax.toFixed(2),
         costTotal: costTotal.toFixed(2),
-        profit: profit.toFixed(2),
-
-        sale: {
-          ...r.sale,
-          total: r.sale.total.toFixed(2),
-        },
+        profit: (revenueExTax - costTotal).toFixed(2),
+        sale: { ...r.sale, total: r.sale.total.toFixed(2) },
       };
     });
 
-    return res.json({
-      costBasis: costBasis.toFixed(2),
-      costBasisMeta: {
-        mode: cb.mode,
-        basisDate: cb.basisDate ? cb.basisDate.toISOString() : null,
-      },
-      rows: out,
-    });
+    return res.json({ rows: out });
   } catch (e) {
     console.error(e);
-    return res
-      .status(500)
-      .json({ error: "Failed to load product sales history" });
+    return res.status(500).json({ error: "Failed to load product sales history" });
   }
 });
 

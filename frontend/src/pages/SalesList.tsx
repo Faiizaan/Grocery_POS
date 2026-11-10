@@ -9,6 +9,7 @@ import {
 } from '../components/VoidSaleConfirm';
 import { useSalesListQuery, type SalesListRow } from '../hooks/queries';
 import { ApiError } from '../lib/apiJson';
+import { formatDateTime } from '../lib/time';
 
 const PAGE_SIZE_OPTIONS = [20, 30] as const;
 
@@ -119,7 +120,7 @@ export default function SalesList() {
                             </Link>
                             {r.voidedAt && <span className="void-badge">VOID</span>}
                         </div>
-                        <div>{new Date(r.createdAt).toLocaleString()}</div>
+                        <div>{formatDateTime(r.createdAt)}</div>
                         <div className="text-right">{r.itemCount}</div>
                         <div className="text-right">Rs {Number(r.subtotal).toFixed(2)}</div>
                         <div className="text-right muted">- Rs {Number(r.discountValue).toFixed(2)}</div>

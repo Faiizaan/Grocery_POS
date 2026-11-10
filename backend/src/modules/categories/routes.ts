@@ -25,6 +25,7 @@ categories.get("/:id", async (req, res) => {
 
   const where = {
     categoryId: id,
+    deletedAt: null,
     ...(q
       ? {
           OR: [

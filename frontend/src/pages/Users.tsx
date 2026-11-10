@@ -1,3 +1,4 @@
+import { formatDateTime } from "../lib/time";
 import { FormEvent, useState } from "react";
 import { StatusLine } from "../components/StatusLine";
 import { useCreateUserMutation, useUsersQuery } from "../hooks/queries";
@@ -101,7 +102,7 @@ export default function Users() {
                 <tr key={u.id}>
                   <td>{u.email}</td>
                   <td>{u.role}</td>
-                  <td>{new Date(u.createdAt).toLocaleString()}</td>
+                  <td>{formatDateTime(u.createdAt)}</td>
                 </tr>
               ))}
             </tbody>

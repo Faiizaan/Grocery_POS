@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { StatusLine } from "../components/StatusLine";
+import StockValue from "../components/StockValue";
 import { apiFetch } from "../lib/api";
 import {
   useCategoriesQuery,
@@ -45,8 +46,77 @@ export default function Products() {
   const [formSalePrice, setFormSalePrice] = useState("");
   const [formBarcode, setFormBarcode] = useState("");
   const [formCategoryId, setFormCategoryId] = useState<string>("");
+  const [formPpb, setFormPpb] = useState<string>("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Multi-delete state
+  const [selected, setSelected] = useState<Map<number, string>>(new Map()); // id -> name
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [deletePassword, setDeletePassword] = useState("");
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const allOnPageSelected =
+    items.length > 0 && items.every((p) => selected.has(p.id));
+
+  const toggleOne = (p: Product) => {
+    setSelected((prev) => {
+      const next = new Map(prev);
+      if (next.has(p.id)) next.delete(p.id);
+      else next.set(p.id, p.name);
+      return next;
+    });
+  };
+
+  const toggleAllOnPage = () => {
+    setSelected((prev) => {
+      const next = new Map(prev);
+      if (allOnPageSelected) items.forEach((p) => next.delete(p.id));
+      else items.forEach((p) => next.set(p.id, p.name));
+      return next;
+    });
+  };
+
+  const openDelete = () => {
+    setDeletePassword("");
+    setDeleteError(null);
+    setDeleteOpen(true);
+  };
+
+  const closeDelete = () => {
+    if (deleting) return;
+    setDeleteOpen(false);
+    setDeletePassword("");
+    setDeleteError(null);
+  };
+
+  const confirmDelete = async () => {
+    if (!deletePassword) {
+      setDeleteError("Enter the delete password.");
+      return;
+    }
+    setDeleting(true);
+    setDeleteError(null);
+    const res = await apiFetch("/api/products/delete", {
+      method: "POST",
+      body: JSON.stringify({ ids: [...selected.keys()], password: deletePassword }),
+    });
+    const data = await res.json().catch(() => ({}));
+    setDeleting(false);
+    if (!res.ok) {
+      setDeleteError(data?.error || "Failed to delete products.");
+      return;
+    }
+    const count = Array.isArray(data?.deleted) ? data.deleted.length : 0;
+    setNotice(`Deleted ${count} product${count === 1 ? "" : "s"}.`);
+    setSelected(new Map());
+    setDeleteOpen(false);
+    setDeletePassword("");
+    void queryClient.invalidateQueries({ queryKey: queryKeys.products.all });
+    await refetch();
+  };
 
   const catNameById = useMemo(() => {
     const m = new Map<number, string>();
@@ -65,6 +135,7 @@ export default function Products() {
     setFormPrice(p.price ?? "");
     setFormSalePrice(p.salePrice ?? "");
     setFormBarcode(p.barcode ?? "");
+    setFormPpb(p.piecesPerBox ? String(p.piecesPerBox) : "");
     setFormCategoryId(
       p.categoryId != null
         ? String(p.categoryId)
@@ -82,6 +153,7 @@ export default function Products() {
     setFormSalePrice("");
     setFormBarcode("");
     setFormCategoryId("");
+    setFormPpb("");
     setSaving(false);
     setError(null);
   };
@@ -144,6 +216,14 @@ export default function Products() {
     if (formCategoryId !== origCid)
       body.categoryId = formCategoryId === "" ? null : Number(formCategoryId);
 
+    const ppbTrim = formPpb.trim();
+    const ppbNum = ppbTrim === "" ? null : Math.floor(Number(ppbTrim));
+    if (ppbNum !== null && !(ppbNum >= 2)) {
+      setError("Pieces per box must be 2 or more (or empty).");
+      return;
+    }
+    if (ppbNum !== (editing.piecesPerBox ?? null)) body.piecesPerBox = ppbNum;
+
     if (Object.keys(body).length === 0) {
       closeEdit();
       return;
@@ -174,6 +254,8 @@ export default function Products() {
   return (
     <div className="products-page">
       <h2>Products</h2>
+
+      <StockValue />
 
       {/* Search */}
       <form
@@ -217,10 +299,45 @@ export default function Products() {
         )}
       </form>
 
+      {notice && <StatusLine variant="success">{notice}</StatusLine>}
+
+      <div className="products-bulk-bar">
+        <span>
+          {selected.size > 0
+            ? `${selected.size} selected`
+            : "Tick products to delete them"}
+        </span>
+        {selected.size > 0 && (
+          <button
+            type="button"
+            className="btn btn-outline"
+            onClick={() => setSelected(new Map())}
+          >
+            Clear selection
+          </button>
+        )}
+        <button
+          type="button"
+          className="btn btn-danger"
+          disabled={selected.size === 0}
+          onClick={openDelete}
+        >
+          Delete selected{selected.size > 0 ? ` (${selected.size})` : ""}
+        </button>
+      </div>
+
       {/* Table */}
       <table className="table">
         <thead>
           <tr>
+            <th style={{ width: 32 }}>
+              <input
+                type="checkbox"
+                aria-label="Select all on this page"
+                checked={allOnPageSelected}
+                onChange={toggleAllOnPage}
+              />
+            </th>
             <th className="mono">ID</th>
             <th>Name</th>
             <th>SKU</th>
@@ -250,6 +367,14 @@ export default function Products() {
                     : undefined
               }
             >
+              <td>
+                <input
+                  type="checkbox"
+                  aria-label={`Select ${p.name}`}
+                  checked={selected.has(p.id)}
+                  onChange={() => toggleOne(p)}
+                />
+              </td>
               <td className="mono">{p.id}</td>
               <td>
                 <Link
@@ -258,6 +383,11 @@ export default function Products() {
                 >
                   {p.name}
                 </Link>
+                {p.piecesPerBox ? (
+                  <span className="box-badge" title="Purchased in boxes">
+                    box of {p.piecesPerBox}
+                  </span>
+                ) : null}
               </td>
               <td className="mono">{p.sku}</td>
               <td className="mono">{p.barcode || "-"}</td>
@@ -300,7 +430,7 @@ export default function Products() {
           })}
           {items.length === 0 && !loading && (
             <tr>
-              <td colSpan={10} style={{ textAlign: "center", color: "#777" }}>
+              <td colSpan={12} style={{ textAlign: "center", color: "#777" }}>
                 No products
               </td>
             </tr>
@@ -327,6 +457,57 @@ export default function Products() {
           >
             Next
           </button>
+        </div>
+      )}
+
+      {/* Delete Modal */}
+      {deleteOpen && (
+        <div role="dialog" aria-modal="true" className="modal" onClick={closeDelete}>
+          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+            <h3 className="modal-title">
+              Delete {selected.size} product{selected.size === 1 ? "" : "s"}?
+            </h3>
+            <div className="form">
+              <ul className="delete-list">
+                {[...selected.entries()].slice(0, 15).map(([id, name]) => (
+                  <li key={id}>
+                    #{id} — {name}
+                  </li>
+                ))}
+                {selected.size > 15 && <li>…and {selected.size - 15} more</li>}
+              </ul>
+              <p style={{ fontSize: 13, color: "#555", margin: 0 }}>
+                They will be removed from products, search, checkout and purchases.
+                Past sales and purchases keep their history.
+              </p>
+              <label>
+                <div className="lab">Delete password</div>
+                <input
+                  type="password"
+                  autoFocus
+                  value={deletePassword}
+                  onChange={(e) => setDeletePassword(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void confirmDelete();
+                    if (e.key === "Escape") closeDelete();
+                  }}
+                />
+              </label>
+              {deleteError && <StatusLine variant="error">{deleteError}</StatusLine>}
+              <div className="modal-footer">
+                <button className="btn btn-outline" onClick={closeDelete} disabled={deleting}>
+                  Cancel
+                </button>
+                <button
+                  className="btn btn-danger"
+                  onClick={() => void confirmDelete()}
+                  disabled={deleting}
+                >
+                  {deleting ? "Deleting…" : "Delete"}
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       )}
 
@@ -398,6 +579,18 @@ export default function Products() {
                     if (e.key === "Enter") saveEdit();
                     if (e.key === "Escape") closeEdit();
                   }}
+                />
+              </label>
+
+              <label>
+                <div className="lab">Pieces per box (optional)</div>
+                <input
+                  type="number"
+                  min={2}
+                  step={1}
+                  placeholder="e.g. 6 — leave empty if not sold in boxes"
+                  value={formPpb}
+                  onChange={(e) => setFormPpb(e.target.value)}
                 />
               </label>
 

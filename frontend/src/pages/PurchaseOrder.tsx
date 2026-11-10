@@ -1,8 +1,10 @@
+import { formatDateTime } from "../lib/time";
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { StatusLine, type PageFeedback } from "../components/StatusLine";
 import { PaginationBar } from "../components/PaginationBar";
 import { apiFetch } from "../lib/api";
+import { formatPoQty, poLineCost, rs } from "../lib/poFormat";
 import {
   usePurchaseOrdersListQuery,
   useSupplierOptionsQuery,
@@ -20,7 +22,13 @@ type PO = {
     suggestedQty: string;
     currentStock: string;
     recentSales: string;
-    product: { name: string; sku: string };
+    product: {
+      name: string;
+      sku: string;
+      price?: string;
+      piecesPerBox?: number | null;
+      isWeighted?: boolean;
+    };
   }[];
 };
 
@@ -50,7 +58,15 @@ export default function PurchaseOrder() {
       setFeedback({ variant: "error", message: "Select a supplier." });
       return;
     }
+    if (!(days >= 1 && days <= 90) || !(minDaysCover >= 1 && minDaysCover <= 60)) {
+      setFeedback({
+        variant: "error",
+        message: "Days to analyze must be 1-90 and target days of stock 1-60.",
+      });
+      return;
+    }
     setFeedback(null);
+    setLatest(null);
     setLoading(true);
     const res = await apiFetch("/api/purchase-orders/generate", {
       method: "POST",
@@ -70,7 +86,9 @@ export default function PurchaseOrder() {
       await refetch();
       setFeedback({
         variant: "success",
-        message: `Order saved as PO #${saved.id} (${saved.items.length} items). Open it anytime below.`,
+        message: `Order saved as PO #${saved.id} (${saved.items.length} items, about ${rs(
+          (saved.items as PO["items"]).reduce((t, it) => t + poLineCost(it), 0)
+        )}). Open it anytime below.`,
       });
     } else {
       const errData = await res.json().catch(() => ({}));
@@ -162,7 +180,8 @@ export default function PurchaseOrder() {
               <tr>
                 <th>Product</th>
                 <th>SKU</th>
-                <th style={{ textAlign: "right" }}>Suggested Qty</th>
+                <th style={{ textAlign: "right" }}>Order</th>
+                <th style={{ textAlign: "right" }}>Est. cost</th>
               </tr>
             </thead>
             <tbody>
@@ -170,14 +189,13 @@ export default function PurchaseOrder() {
                 <tr key={it.id}>
                   <td>{it.product.name}</td>
                   <td>{it.product.sku}</td>
-                  <td style={{ textAlign: "right" }}>
-                    {(+it.suggestedQty).toFixed(3)}
-                  </td>
+                  <td style={{ textAlign: "right" }}>{formatPoQty(it)}</td>
+                  <td style={{ textAlign: "right" }}>{rs(poLineCost(it))}</td>
                 </tr>
               ))}
               {latest.items.length > 5 && (
                 <tr>
-                  <td colSpan={3} style={{ textAlign: "center", color: "#666" }}>
+                  <td colSpan={4} style={{ textAlign: "center", color: "#666" }}>
                     +{latest.items.length - 5} more —{" "}
                     <Link to={`/purchase-order/${latest.id}`}>see all</Link>
                   </td>
@@ -185,7 +203,7 @@ export default function PurchaseOrder() {
               )}
               {latest.items.length === 0 && (
                 <tr>
-                  <td colSpan={3} style={{ textAlign: "center" }}>
+                  <td colSpan={4} style={{ textAlign: "center" }}>
                     No reorder suggestions for this run.
                   </td>
                 </tr>
@@ -220,12 +238,15 @@ export default function PurchaseOrder() {
             {" · "}
             <Link to={`/suppliers/${po.supplier.id}`}>{po.supplier.name}</Link>
             {" · "}
-            {new Date(po.createdAt).toLocaleString()}
+            {formatDateTime(po.createdAt)}
             {" · "}
             <span style={{ color: "#666" }}>{po.status}</span>
           </div>
           <div>
             {po.items.length} item(s)
+            {po.items.length > 0
+              ? ` · about ${rs(po.items.reduce((t, it) => t + poLineCost(it), 0))}`
+              : ""}
             {po.note ? ` · Note: ${po.note}` : ""}
           </div>
         </div>
